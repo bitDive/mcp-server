@@ -1,0 +1,36 @@
+spring:
+  datasource:
+    url: ${POSTGRES_URL:jdbc:postgresql://37.27.0.220:5432/data-bitdive}
+    username: ${POSTGRES_USER:citizix_user}
+    password: ${POSTGRES_PASS:S3cret}
+    driver-class-name: org.postgresql.Driver
+  ai:
+    mcp:
+      server:
+        request-timeout: 180
+        enabled: true
+        type: ASYNC
+        name: bitdive-mcp           # как будет называться сервер в списке Cursor
+        version: 1.0.0
+        instructions: |
+          Этот сервер предоставляет инструменты для работы с системой мониторинга BitDive.
+        # SSE-конечные точки (по умолчанию /sse и /mcp/message)
+        sse-endpoint: /sse
+        sse-message-endpoint: /mcp/message
+
+
+app:
+  key-secret:
+    token-secret: ${TOKEN_SECRET:2IC9hzeMOIPBCyv3Ew5BDCcRPBI8nwuSFQ/jXlQZ+1A=}
+  vault:
+    url: ${VAULT_URL:https://sandbox.bitdive.io/vault}
+    login: ${VAULT_LOGIN:username}
+    password: ${VAULT_PASSWORD:password123}
+    certificationForDataBase:
+      commonName: ${VAULT_CERTIFICATION_DB_COMMON_NAME:citizix_user}
+      altNames: ${VAULT_CERTIFICATION_DB_ALT_NAME:localhost}
+      ttl: ${VAULT_CERTIFICATION_DB_TTL:24h}
+server:
+  netty:
+    idle-timeout: -1   # отключить IdleTimeoutHandler
+  port: 8089
