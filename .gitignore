@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.env
+.env.*
+debug_scripts/
+.idea/
+.agents/
+openapi.json
+bitdive.mcp.json
+AGENTS.md
