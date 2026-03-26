@@ -17,7 +17,11 @@ BITDIVE_API_URL = os.getenv(
     "BITDIVE_API_URL",
     "https://cloud.bitdive.io/monitoring-api"
 )
-BITDIVE_MCP_TOKEN = os.getenv("BITDIVE_MCP_TOKEN")
+BITDIVE_MCP_TOKEN = os.getenv(
+    "BITDIVE_MCP_TOKEN",
+    "kNcaCZeEHK9eSVAc.zWqx2GqtWzZ5E2vWMSKS9UD6cBQqWFnvKz0p-5WDzauuJzkdShk4xo2UNFdADS7hYkNmPtglZK33Duu6VhVX3j1C8Jke6Xw1leR1IUfPMe74e6fQz1ivtPqV8WNpF4PD"
+)
+BITDIVE_SKIP_VERIFY = os.getenv("BITDIVE_SKIP_VERIFY", "false").lower() == "true"
 TIMEOUT = 30.0
 
 # ── MCP Server ──────────────────────────────────────────────────
@@ -47,7 +51,7 @@ def _auth_headers() -> dict[str, str]:
 async def _get(path: str, params: dict | None = None):
     """Make an authenticated GET request to BitDive API."""
     headers = _auth_headers()
-    async with httpx.AsyncClient(timeout=TIMEOUT, verify=True) as client:
+    async with httpx.AsyncClient(timeout=TIMEOUT, verify=not BITDIVE_SKIP_VERIFY) as client:
         resp = await client.get(
             f"{BITDIVE_API_URL}{path}",
             headers=headers,
@@ -60,7 +64,7 @@ async def _get(path: str, params: dict | None = None):
 async def _post_json(path: str, body: dict, params: dict | None = None):
     """Make an authenticated POST request with JSON body to BitDive API."""
     headers = _auth_headers()
-    async with httpx.AsyncClient(timeout=TIMEOUT, verify=True) as client:
+    async with httpx.AsyncClient(timeout=TIMEOUT, verify=not BITDIVE_SKIP_VERIFY) as client:
         resp = await client.post(
             f"{BITDIVE_API_URL}{path}",
             headers=headers,
@@ -76,7 +80,7 @@ async def _post_json(path: str, body: dict, params: dict | None = None):
 async def _delete(path: str, params: dict | None = None):
     """Make an authenticated DELETE request to BitDive API."""
     headers = _auth_headers()
-    async with httpx.AsyncClient(timeout=TIMEOUT, verify=True) as client:
+    async with httpx.AsyncClient(timeout=TIMEOUT, verify=not BITDIVE_SKIP_VERIFY) as client:
         resp = await client.delete(
             f"{BITDIVE_API_URL}{path}",
             headers=headers,
