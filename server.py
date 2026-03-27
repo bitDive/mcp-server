@@ -113,6 +113,336 @@ def _normalize_sql(sql: str) -> str:
     return sql.strip()
 
 
+_VOLATILE_KEY_RE = re.compile(
+    r"(^|\.)(id|.*Id|traceId|spanId|messageId|callId|uuid|timestamp|date|createdAt|updatedAt)$",
+    re.IGNORECASE,
+)
+_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ][0-9:\.\-+Z]*$")
+
+
+def _normalize_typed_key(key: str) -> str:
+    """Collapse BitDive's typed map keys into plain field names."""
+    if key.startswith("string:") and key.count(":") >= 2:
+        return key.split(":", 2)[2]
+    return key
+
+
+def _looks_like_json_blob(value: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    trimmed = value.strip()
+    return (
+        trimmed.startswith("{")
+        or trimmed.startswith("[")
+        or trimmed.startswith("\"{")
+        or trimmed.startswith("\"[")
+    )
+
+
+def _safe_json_loads(raw: str):
+    """Parse JSON when possible, including quoted JSON payloads."""
+    if not isinstance(raw, str):
+        return raw
+    text = raw.strip()
+    if not text:
+        return raw
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return raw
+    if isinstance(parsed, str) and _looks_like_json_blob(parsed):
+        return _safe_json_loads(parsed)
+    return parsed
+
+
+def _normalize_payload(value):
+    """Generic normalization for BitDive typed JSON structures."""
+    if isinstance(value, str):
+        parsed = _safe_json_loads(value)
+        if parsed is value:
+            return value.strip()
+        return _normalize_payload(parsed)
+
+    if isinstance(value, list):
+        if len(value) == 2 and isinstance(value[0], str) and value[0].startswith("java."):
+            return _normalize_payload(value[1])
+        return [_normalize_payload(item) for item in value]
+
+    if isinstance(value, dict):
+        normalized = {}
+        class_name = value.get("@class")
+        if class_name and not class_name.startswith("java.util."):
+            normalized["__class__"] = class_name.rsplit(".", 1)[-1]
+        for key, item in value.items():
+            if key == "@class":
+                continue
+            normalized[_normalize_typed_key(key)] = _normalize_payload(item)
+        if set(normalized.keys()) == {"parIndex", "paramType", "val"}:
+            return {
+                "index": normalized.get("parIndex"),
+                "type": normalized.get("paramType"),
+                "value": normalized.get("val"),
+            }
+        return normalized
+
+    return value
+
+
+def _summarize_scalar(value) -> str:
+    text = str(value)
+    if len(text) > 180:
+        return f"{text[:177]}..."
+    return text
+
+
+def _is_volatile_change(path: str, before, after) -> bool:
+    if _VOLATILE_KEY_RE.search(path):
+        return True
+    for value in (before, after):
+        if isinstance(value, str) and (_UUID_RE.search(value) or _ISO_DATE_RE.match(value)):
+            return True
+    return False
+
+
+def _diff_values(before, after, path: str = "", changes: list | None = None, *, ignore_volatile: bool = False):
+    """Recursively diff normalized payloads."""
+    if changes is None:
+        changes = []
+
+    if before == after:
+        return changes
+
+    if type(before) != type(after):
+        if not (ignore_volatile and _is_volatile_change(path, before, after)):
+            changes.append(f"{path or '$'}: type {type(before).__name__} -> {type(after).__name__}")
+        return changes
+
+    if isinstance(before, dict):
+        before_keys = set(before.keys())
+        after_keys = set(after.keys())
+        for key in sorted(before_keys - after_keys):
+            sub_path = f"{path}.{key}" if path else key
+            if ignore_volatile and _is_volatile_change(sub_path, before.get(key), None):
+                continue
+            changes.append(f"{sub_path}: removed")
+        for key in sorted(after_keys - before_keys):
+            sub_path = f"{path}.{key}" if path else key
+            if ignore_volatile and _is_volatile_change(sub_path, None, after.get(key)):
+                continue
+            changes.append(f"{sub_path}: added={_summarize_scalar(after[key])}")
+        for key in sorted(before_keys & after_keys):
+            sub_path = f"{path}.{key}" if path else key
+            _diff_values(before[key], after[key], sub_path, changes, ignore_volatile=ignore_volatile)
+        return changes
+
+    if isinstance(before, list):
+        if len(before) != len(after):
+            if not (ignore_volatile and _is_volatile_change(path, len(before), len(after))):
+                changes.append(f"{path or '$'}: list length {len(before)} -> {len(after)}")
+        for index, (before_item, after_item) in enumerate(zip(before[:5], after[:5])):
+            _diff_values(before_item, after_item, f"{path}[{index}]", changes, ignore_volatile=ignore_volatile)
+        return changes
+
+    if isinstance(before, str) and isinstance(after, str):
+        if len(before) > 240 or len(after) > 240:
+            if before != after and not (ignore_volatile and _is_volatile_change(path, before, after)):
+                changes.append(
+                    f"{path or '$'}: text changed "
+                    f"(len {len(before)} -> {len(after)}, before={_summarize_scalar(before)}, after={_summarize_scalar(after)})"
+                )
+            return changes
+
+    if not (ignore_volatile and _is_volatile_change(path, before, after)):
+        changes.append(
+            f"{path or '$'}: {_summarize_scalar(before)} -> {_summarize_scalar(after)}"
+        )
+    return changes
+
+
+def _signature(node: dict) -> str:
+    return f"{_short_class(node.get('className', '?'))}.{node.get('methodName', '?')}()"
+
+
+def _build_contract_entries(trace: dict) -> list[dict]:
+    """Extract generic request/response contracts for every node in the trace tree."""
+    entries = []
+    path_counts: Counter[str] = Counter()
+
+    def _walk(node: dict, parent_path: str = ""):
+        signature = _signature(node)
+        path_counts[parent_path] += 1
+        ordinal = path_counts[parent_path]
+        path = f"{parent_path}/{signature}[{ordinal}]"
+
+        request_contract = {}
+        args_payload = _normalize_payload(node.get("args"))
+        if args_payload not in (None, "", [], {}):
+            request_contract["args"] = args_payload
+        body_payload = _normalize_payload(node.get("bodyRest"))
+        if body_payload not in (None, "", [], {}):
+            request_contract["body"] = body_payload
+        header_payload = _normalize_payload(node.get("headerRest"))
+        if header_payload not in (None, "", [], {}):
+            request_contract["headers"] = header_payload
+        url_payload = node.get("urlRest") or node.get("url")
+        if url_payload:
+            request_contract["url"] = url_payload
+
+        response_contract = {}
+        return_payload = _normalize_payload(node.get("methodReturn"))
+        if return_payload not in (None, "", [], {}):
+            response_contract["return"] = return_payload
+        status = node.get("codeResponse")
+        if status:
+            response_contract["status"] = status
+        error_message = node.get("errorCallMessage")
+        if error_message:
+            response_contract["error"] = error_message
+
+        rest_contracts = []
+        for rest in node.get("restCalls", []):
+            rest_contracts.append(
+                {
+                    "method": rest.get("methodRest") or rest.get("method"),
+                    "uri": rest.get("uri"),
+                    "status": rest.get("statusCode"),
+                    "requestHeaders": _normalize_payload(rest.get("headers")),
+                    "requestBody": _normalize_payload(rest.get("body")),
+                    "responseHeaders": _normalize_payload(rest.get("responseHeaders")),
+                    "responseBody": _normalize_payload(rest.get("responseBody")),
+                    "error": rest.get("errorCallMessage"),
+                }
+            )
+
+        entry = {
+            "path": path,
+            "signature": signature,
+            "operationType": node.get("operationType"),
+            "request": request_contract,
+            "response": response_contract,
+            "restCalls": rest_contracts,
+            "delta": node.get("callTimeDelta") or 0,
+        }
+        entries.append(entry)
+
+        for child in node.get("childCalls", []):
+            _walk(child, path)
+
+    _walk(trace)
+    return entries
+
+
+def _index_contract_entries(entries: list[dict]) -> dict[str, dict]:
+    return {entry["path"]: entry for entry in entries}
+
+
+def _format_contract_section(before: dict, after: dict) -> list[str]:
+    lines = []
+
+    root_before = {
+        "request": before.get("request", {}),
+        "response": before.get("response", {}),
+    }
+    root_after = {
+        "request": after.get("request", {}),
+        "response": after.get("response", {}),
+    }
+    root_changes = _diff_values(root_before, root_after, ignore_volatile=True)
+    if root_changes:
+        lines.append("ROOT CONTRACT CHANGES:")
+        lines.extend(f"  - {change}" for change in root_changes[:15])
+        if len(root_changes) > 15:
+            lines.append(f"  ... and {len(root_changes) - 15} more root changes")
+        lines.append("")
+
+    request_changes = _diff_values(before.get("request", {}), after.get("request", {}), ignore_volatile=True)
+    if request_changes:
+        lines.append("ROOT REQUEST DIFF:")
+        lines.extend(f"  - {change}" for change in request_changes[:10])
+        lines.append("")
+
+    response_changes = _diff_values(before.get("response", {}), after.get("response", {}), ignore_volatile=True)
+    if response_changes:
+        lines.append("ROOT RESPONSE DIFF:")
+        lines.extend(f"  - {change}" for change in response_changes[:10])
+        lines.append("")
+
+    return lines
+
+
+def _format_path_contract_changes(before_entries: list[dict], after_entries: list[dict]) -> list[str]:
+    lines = []
+    before_index = _index_contract_entries(before_entries)
+    after_index = _index_contract_entries(after_entries)
+
+    changed_nodes = []
+    for path in sorted(set(before_index.keys()) & set(after_index.keys())):
+        before_entry = before_index[path]
+        after_entry = after_index[path]
+        changes = _diff_values(
+            {
+                "request": before_entry.get("request", {}),
+                "response": before_entry.get("response", {}),
+                "restCalls": before_entry.get("restCalls", []),
+            },
+            {
+                "request": after_entry.get("request", {}),
+                "response": after_entry.get("response", {}),
+                "restCalls": after_entry.get("restCalls", []),
+            },
+            ignore_volatile=True,
+        )
+        if changes:
+            changed_nodes.append((path, before_entry["signature"], changes))
+
+    if changed_nodes:
+        lines.append("PAYLOAD / CONTRACT DRIFT:")
+        for path, signature, changes in changed_nodes[:8]:
+            lines.append(f"  {signature} @ {path}")
+            for change in changes[:4]:
+                lines.append(f"    - {change}")
+            if len(changes) > 4:
+                lines.append(f"    ... and {len(changes) - 4} more changes")
+        if len(changed_nodes) > 8:
+            lines.append(f"  ... and {len(changed_nodes) - 8} more changed nodes")
+        lines.append("")
+
+    added_paths = sorted(set(after_index.keys()) - set(before_index.keys()))
+    removed_paths = sorted(set(before_index.keys()) - set(after_index.keys()))
+    if added_paths or removed_paths:
+        lines.append("TRACE PATH CHANGES:")
+        for path in added_paths[:6]:
+            lines.append(f"  + {path}")
+        for path in removed_paths[:6]:
+            lines.append(f"  - {path}")
+        if len(added_paths) > 6 or len(removed_paths) > 6:
+            lines.append("  ... additional path changes omitted")
+        lines.append("")
+
+    downstream_changes = []
+    for path in sorted(set(before_index.keys()) & set(after_index.keys())):
+        before_rest = before_index[path].get("restCalls", [])
+        after_rest = after_index[path].get("restCalls", [])
+        changes = _diff_values(before_rest, after_rest, ignore_volatile=True)
+        if changes:
+            downstream_changes.append((path, before_index[path]["signature"], changes))
+    if downstream_changes:
+        lines.append("DOWNSTREAM HTTP CONTRACT CHANGES:")
+        for path, signature, changes in downstream_changes[:6]:
+            lines.append(f"  {signature} @ {path}")
+            for change in changes[:4]:
+                lines.append(f"    - {change}")
+        if len(downstream_changes) > 6:
+            lines.append(f"  ... and {len(downstream_changes) - 6} more downstream changes")
+        lines.append("")
+
+    return lines
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Dashboard / HeatMap  (from HeadMapTools.java)
 # ═══════════════════════════════════════════════════════════════
@@ -1183,6 +1513,8 @@ async def compare_traces(before_call_id: str, after_call_id: str) -> str:
     """
     before = await _get("/mcp/FindTrace/findTraceAll", {"callId": before_call_id})
     after = await _get("/mcp/FindTrace/findTraceAll", {"callId": after_call_id})
+    before_contracts = _build_contract_entries(before) if before else []
+    after_contracts = _build_contract_entries(after) if after else []
 
     def _collect_data(node, data):
         cls = _short_class(node.get("className", "?"))
@@ -1274,10 +1606,13 @@ async def compare_traces(before_call_id: str, after_call_id: str) -> str:
 
     b_delta = before.get("callTimeDelta", 0)
     a_delta = after.get("callTimeDelta", 0)
+    root_label = f"{_short_class(before.get('className','?'))}.{before.get('methodName','?')}()"
+    if root_label == "?.?()":
+        root_label = f"{_short_class(after.get('className','?'))}.{after.get('methodName','?')}()"
 
     lines = [
         f"=== TRACE COMPARISON ===",
-        f"Method: {_short_class(before.get('className','?'))}.{before.get('methodName','?')}()",
+        f"Method: {root_label}",
         f"",
         f"BEFORE ({before_call_id[:8]}...):",
         f"  Time: {b_delta:.2f}ms | Status: {before.get('codeResponse', '?')} | SQLs: {len(b_data['sqls'])} | Steps: {len(b_data['methods'])}",
@@ -1285,6 +1620,10 @@ async def compare_traces(before_call_id: str, after_call_id: str) -> str:
         f"  Time: {a_delta:.2f}ms | Status: {after.get('codeResponse', '?')} | SQLs: {len(a_data['sqls'])} | Steps: {len(a_data['methods'])}",
         f"",
     ]
+
+    if before_contracts and after_contracts:
+        lines.extend(_format_contract_section(before_contracts[0], after_contracts[0]))
+        lines.extend(_format_path_contract_changes(before_contracts, after_contracts))
 
 
     # --- Section: Methods Diff ---
