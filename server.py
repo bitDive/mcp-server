@@ -821,7 +821,6 @@ async def create_test_group(
     """Creates a NEW test group in BitDive from a list of call (trace) IDs.
 
     ⚠️ WARNING: This creates a BRAND NEW test group with a new UUID.
-    If you need to UPDATE an existing test group, use update_existing_test_group instead.
     Check TestControllerTestAbstract.java for existing test group UUIDs before creating new ones.
     New groups will NOT be executed by Maven unless their UUID is added to the Java test file.
 
@@ -1004,268 +1003,22 @@ async def enabled_test_script(test_script_id: str, enabled: bool = True) -> str:
     )
     return json.dumps(data, ensure_ascii=False, default=str)
 
-@mcp.tool()
+@mcp.tool(description="Regenerate tests for a script using a new set of call IDs")
 async def regenerate_tests_by_call_for_test_script(
     script_data_test_id: str,
     new_call_ids: list[str]
 ) -> str:
-    """Replaces a method test cluster using only MCP endpoints that are currently accessible."""
-    body = await _build_replace_payload(script_data_test_id)
-    body["newCallIds"] = new_call_ids
+    dto = await _get(
+        "/mcp/Testing/getTestsByCallForTestScript",
+        {"scriptDataTestId": script_data_test_id},
+    )
+    if not isinstance(dto, dict):
+        raise RuntimeError(
+            f"getTestsByCallForTestScript returned unexpected data for scriptDataTestId={script_data_test_id!r}"
+        )
+    body = {**dto, "newCallIds": new_call_ids}
     data = await _post_json("/mcp/Testing/regenerateTestsByCallForTestScript", body)
     return json.dumps(data, ensure_ascii=False, default=str)
-
-
-
-async def auto_generate_tests_for_service(
-    module_name: str,
-    service_name: str,
-    test_name: str = "",
-    test_type: str = "UNIT",
-) -> str:
-    """Automatically creates tests for ALL methods of a service.
-    
-    Flow:
-    1. Fetches all recent calls for the service via get_last_calls
-    2. Groups calls by className + methodName
-    3. Picks the LATEST call (by callDateTime) for each unique method
-    4. Creates a test group with all those call IDs
-    
-    This replicates the "Fill with last calls" + "Generate" flow from
-    the BitDive QA frontend, but in a single MCP call.
-    
-    Args:
-        module_name: Module name (e.g., "n6ri19tck6y")
-        service_name: Service name (e.g., "faculty-microservice")
-        test_name: Optional test name (auto-generated if empty)
-        test_type: "UNIT" (default), "COMPONENT", or "INTEGRATION"
-    
-    Returns: Summary of what was created (methods covered, call IDs used)
-    """
-    # Step 1: Fetch all last calls
-    raw_data = await _get("/mcp/LastCallService/getData", {
-        "moduleName": module_name,
-        "serviceName": service_name,
-    })
-
-    if not raw_data:
-        return "No calls found for this service. Make some API calls first."
-
-    # Step 1b: Flatten nested structures — API may return various formats
-    all_calls = []
-    if isinstance(raw_data, list):
-        for item in raw_data:
-            if isinstance(item, dict):
-                # Could be a direct call record or a wrapper with nested lists
-                if "className" in item and "methodName" in item:
-                    all_calls.append(item)
-                else:
-                    # Try to extract nested call records
-                    for key, val in item.items():
-                        if isinstance(val, list):
-                            for sub in val:
-                                if isinstance(sub, dict) and "className" in sub:
-                                    all_calls.append(sub)
-            elif isinstance(item, list):
-                for sub in item:
-                    if isinstance(sub, dict) and "className" in sub:
-                        all_calls.append(sub)
-    elif isinstance(raw_data, dict):
-        # Single wrapper object
-        for key, val in raw_data.items():
-            if isinstance(val, list):
-                for sub in val:
-                    if isinstance(sub, dict) and "className" in sub:
-                        all_calls.append(sub)
-
-    if not all_calls:
-        return f"No valid call records found. Raw data type: {type(raw_data).__name__}, keys: {list(raw_data.keys()) if isinstance(raw_data, dict) else 'N/A'}"
-
-    # Step 2: Group by className + methodName, keep latest per method
-    method_map: dict[str, dict] = {}  # key -> best call
-    for call in all_calls:
-        cls = call.get("className", "")
-        method = call.get("methodName", "")
-        dt = call.get("callDateTime", "")
-        trace_id = call.get("traceId", "") or call.get("messageId", "")
-
-        if not cls or not method or not trace_id:
-            continue
-
-        key = f"{cls}.{method}"
-        existing = method_map.get(key)
-        if existing is None or dt > existing["callDateTime"]:
-            method_map[key] = {
-                "className": cls,
-                "methodName": method,
-                "traceId": trace_id,
-                "callDateTime": dt,
-            }
-
-    if not method_map:
-        return "No valid method calls found to create tests from."
-
-    # Step 3: Collect call IDs
-    call_ids = [v["traceId"] for v in method_map.values()]
-
-    # Step 4: Generate test name if not provided
-    if not test_name:
-        test_name = f"{service_name} Auto Tests ({len(call_ids)} methods)"
-
-    # Step 5: Create the test group
-    body = {
-        "name": test_name,
-        "type": test_type.upper(),
-        "testDataRules": {
-            "callIdList": call_ids
-        }
-    }
-
-    result = None
-    create_error = None
-
-    try:
-        result = await _post_json("/mcp/Testing/createTestGroup", body)
-    except Exception as e:
-        create_error = str(e)
-
-    # Step 6: Build summary
-    lines = []
-    if result:
-        # result can be a list or dict depending on API changes
-        group_id = result[0].get('id', '?') if isinstance(result, list) and result else (result.get('id', '?') if isinstance(result, dict) else '?')
-        lines += [
-            f"✅ Test group created: {test_name}",
-            f"Type: {test_type.upper()}",
-            f"Methods covered: {len(method_map)}",
-            f"Test group ID/IDs: {group_id}",
-        ]
-    else:
-        lines += [
-            f"⚠️ Could not auto-create test group (auth issue: {create_error})",
-            f"However, all data is ready. You can create the test via BitDive UI.",
-            f"",
-            f"Test name: {test_name}",
-            f"Type: {test_type.upper()}",
-            f"Methods found: {len(method_map)}",
-            f"Call IDs: {json.dumps(call_ids)}",
-        ]
-
-    lines += ["", "Methods included:"]
-    for key, info in sorted(method_map.items()):
-        short_cls = info["className"].rsplit(".", 1)[-1]
-        lines.append(
-            f"  • {short_cls}.{info['methodName']}() "
-            f"[call: {info['traceId'][:12]}... @ {info['callDateTime']}]"
-        )
-
-    return "\n".join(lines)
-
-
-async def update_existing_test_group(
-    test_script_id: str,
-    module_name: str,
-    service_name: str,
-    new_call_ids: list[str] | None = None,
-) -> str:
-    """Updates an EXISTING test group with new trace data.
-    Use this instead of create_test_group when you want to refresh tests
-    for an existing test script (e.g., after code changes).
-    
-    If new_call_ids is not provided, automatically fetches the latest calls
-    for the service (equivalent to "Fill with last calls" in BitDive UI).
-    
-    Args:
-        test_script_id: UUID of the existing test group (from TestControllerTestAbstract.java)
-        module_name: Module name (e.g., "n6ri19tck6y")
-        service_name: Service name (e.g., "faculty-microservice")
-        new_call_ids: Optional list of specific trace IDs to use. If empty, auto-fills from latest calls.
-    
-    Returns: Summary of updated methods
-    """
-    # Step 1: Get current script data to find all class-level entries
-    script_data = await _get("/mcp/Testing/getScriptData", {"testScriptId": test_script_id})
-    if not script_data:
-        return json.dumps({"error": f"Test script {test_script_id} not found"})
-
-    # Step 2: If no call IDs provided, fetch latest calls
-    if not new_call_ids:
-        raw_data = await _get("/mcp/LastCallService/getData", {
-            "moduleName": module_name,
-            "serviceName": service_name,
-        })
-        # Extract call IDs from the response
-        new_call_ids = []
-        if isinstance(raw_data, list):
-            for item in raw_data:
-                if isinstance(item, dict):
-                    tid = item.get("traceId") or item.get("messageId")
-                    if tid and tid not in new_call_ids:
-                        new_call_ids.append(tid)
-        if not new_call_ids:
-            return "No recent calls found to update tests with."
-
-    # Step 3: Iterate over each class entry and regenerate
-    results = []
-    errors = []
-    for entry in script_data:
-        entry_id = entry.get("id", "")
-        class_name = entry.get("className", "")
-        entry_service = entry.get("serviceName", "")
-        
-        # Only update entries matching our service
-        if entry_service != service_name:
-            results.append(f"  ⏭ {class_name} — skipped (service: {entry_service})")
-            continue
-
-        try:
-            # 1. First, fetch the method-level tests for this class entry
-            test_entries = await _get("/mcp/Testing/getScriptDataTest", {"testScriptDataId": entry_id})
-            
-            if not test_entries or not isinstance(test_entries, list):
-                errors.append(f"  ⚠ {class_name} — no test entries found to replace")
-                continue
-            
-            # 2. Get the test ID and fetch its comprehensive metadata (which contains the original callId)
-            test_id = test_entries[0].get("id")
-            existing_data = await _get("/mcp/Testing/getTestsByCallForTestScript", {"scriptDataTestId": test_id})
-            
-            call_id = existing_data.get("callId") if existing_data else None
-            method_name = existing_data.get("methodName") if existing_data else test_entries[0].get("entrypoint", {}).get("method")
-            
-            # 3. Build a precise payload to replace ONLY the tests in this class
-            body = {
-                "tests": [
-                    {"testName": t.get("name", ""), "scriptDataTest": t.get("id")}
-                    for t in test_entries if t.get("id")
-                ],
-                "moduleName": module_name,
-                "serviceName": service_name,
-                "className": class_name,
-                "methodName": method_name,
-                "testScriptIdList": [test_script_id],
-                "callId": call_id,
-                "newCallIds": new_call_ids
-            }
-
-            await _post_json("/mcp/Testing/regenerateTestsByCallForTestScript", body)
-            results.append(f"  ✅ {class_name} — regenerated")
-        except Exception as e:
-            errors.append(f"  ❌ {class_name} — {str(e)[:100]}")
-
-    lines = [
-        f"Update results for test script {test_script_id}:",
-        f"Call IDs used: {new_call_ids[:3]}{'...' if len(new_call_ids) > 3 else ''}",
-        "",
-    ]
-    if results:
-        lines.append("Results:")
-        lines.extend(results)
-    if errors:
-        lines.append("\nErrors:")
-        lines.extend(errors)
-
-    return "\n".join(lines)
 
 
 @mcp.tool()
