@@ -10,6 +10,7 @@ import httpx
 import re
 import asyncio
 from collections import Counter
+from urllib.parse import parse_qsl, quote, unquote, urlparse, urlunparse
 from mcp.server.fastmcp import FastMCP
 
 # ── Configuration ───────────────────────────────────────────────
@@ -19,7 +20,7 @@ BITDIVE_API_URL = os.getenv(
 )
 BITDIVE_MCP_TOKEN = os.getenv(
     "BITDIVE_MCP_TOKEN",
-    "kNcaCZeEHK9eSVAc.zWqx2GqtWzZ5E2vWMSKS9UD6cBQqWFnvKz0p-5WDzauuJzkdShk4xo2UNFdADS7hYkNmPtglZK33Duu6VhVX3j1C8Jke6Xw1leR1IUfPMe74e6fQz1ivtPqV8WNpF4PD"
+    ""
 )
 BITDIVE_SKIP_VERIFY = os.getenv("BITDIVE_SKIP_VERIFY", "false").lower() == "true"
 TIMEOUT = 30.0
@@ -90,6 +91,70 @@ async def _delete(path: str, params: dict | None = None):
         if resp.status_code != 204 and resp.text.strip():
             return resp.json()
         return {}
+
+
+def _decode_repeatedly(value: str, max_rounds: int = 3) -> str:
+    """Decode URL-encoded text until it stabilizes or the guard limit is reached."""
+    decoded = value
+    for _ in range(max_rounds):
+        next_value = unquote(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+    return decoded
+
+
+def _normalize_reproduction_url(raw_url: str) -> str:
+    """Make captured URLs usable from the host machine."""
+    try:
+        parsed = urlparse(raw_url)
+    except Exception:
+        return raw_url
+
+    hostname = parsed.hostname or ""
+    port = parsed.port
+
+    # Internal Docker DNS names are not usable from the host shell.
+    if hostname.endswith("-ms"):
+        netloc = f"localhost:{port}" if port else "localhost"
+    else:
+        netloc = parsed.netloc
+
+    if parsed.query:
+        query_pairs = [
+            (key, _decode_repeatedly(value))
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        ]
+        query = "&".join(
+            f"{quote(key, safe='')}={quote(value, safe='')}"
+            for key, value in query_pairs
+        )
+    else:
+        query = parsed.query
+
+    return urlunparse(parsed._replace(netloc=netloc, query=query))
+
+
+def _should_skip_reproduction_header(header_name: str) -> bool:
+    normalized = header_name.lower()
+    if normalized in {
+        "@class",
+        "host",
+        "content-length",
+        "connection",
+        "accept-encoding",
+        "expect",
+    }:
+        return True
+    return normalized.startswith("x-bitdiv-")
+
+
+def _escape_single_quotes(value: str) -> str:
+    return value.replace("'", "'\"'\"'")
+
+
+def _escape_powershell_single_quotes(value: str) -> str:
+    return value.replace("'", "''")
 
 
 def _normalize_sql(sql: str) -> str:
@@ -647,7 +712,9 @@ async def get_reproduction_command(call_id: str) -> str:
     
     op_type = trace.get("operationType", "WEB_GET")
     method = op_type.replace("WEB_", "") if op_type.startswith("WEB_") else "GET"
-    url = trace.get("urlRest") or trace.get("url") or "http://localhost:8080/???"
+    url = _normalize_reproduction_url(
+        trace.get("urlRest") or trace.get("url") or "http://localhost:8080/???"
+    )
     
     # Parse headers (Format: {"string:java.lang.String:user-agent": ["java.util.ArrayList", ["..."]]})
     raw_headers = trace.get("headerRest")
@@ -663,6 +730,8 @@ async def get_reproduction_command(call_id: str) -> str:
             for k, v in raw_headers.items():
                 # Clean up Java-serialized keys like "string:java.lang.String:user-agent"
                 key = k.split(":")[-1] if ":" in k else k
+                if _should_skip_reproduction_header(key):
+                    continue
                 # Handle BitDive/Java list format
                 if isinstance(v, list) and len(v) == 2 and v[0] == "java.util.ArrayList":
                     val_list = v[1]
@@ -673,28 +742,31 @@ async def get_reproduction_command(call_id: str) -> str:
                 else:
                     headers[key] = str(v)
 
-    # Remove standard hop-by-hop or internal headers that might break reproduction
-    for h in ["host", "content-length", "connection", "accept-encoding"]:
-        headers.pop(h, None)
-        headers.pop(h.lower(), None)
-
     body = trace.get("bodyRest")
     
     # Generate CURL command
     curl = f"curl -X {method} '{url}'"
     for k, v in headers.items():
-        curl += f" -H '{k}: {v}'"
+        curl += f" -H '{_escape_single_quotes(k)}: {_escape_single_quotes(str(v))}'"
     
     if body:
         # If body is a string (often JSON), escape single quotes for shell
         body_str = json.dumps(body) if not isinstance(body, str) else body
-        curl += f" -d '{body_str}'"
+        curl += f" -d '{_escape_single_quotes(body_str)}'"
 
     # Generate PowerShell Invoke-RestMethod
-    ps_headers = "@{" + "; ".join([f"'{k}'='{v}'" for k, v in headers.items()]) + "}"
-    ps = f"Invoke-RestMethod -Method {method} -Uri '{url}' -Headers {ps_headers}"
+    ps_headers = "@{" + "; ".join(
+        [f"'{_escape_powershell_single_quotes(k)}'='{_escape_powershell_single_quotes(str(v))}'" for k, v in headers.items()]
+    ) + "}"
+    ps = (
+        f"Invoke-RestMethod -Method {method} "
+        f"-Uri '{_escape_powershell_single_quotes(url)}' -Headers {ps_headers}"
+    )
     if body:
-        ps += f" -Body '{body_str}' -ContentType 'application/json'"
+        ps += (
+            f" -Body '{_escape_powershell_single_quotes(body_str)}'"
+            f" -ContentType 'application/json'"
+        )
 
     return (
         f"REPRODUCTION COMMANDS for Call {call_id}:\n\n"
@@ -867,26 +939,28 @@ async def regenerate_tests_by_call_for_test_script(
     for attempt in range(3):
         try:
             existing_data = await _get("/mcp/Testing/getTestsByCallForTestScript", {"scriptDataTestId": test_id_to_use})
-            # A valid response contains testScriptId
-            if existing_data and existing_data.get("testScriptId"):
+            if existing_data and (existing_data.get("testScriptId") or existing_data.get("testScriptIdList")):
                 break
         except Exception:
             pass
         if attempt < 2:
             await asyncio.sleep(3)
 
-    if not existing_data or not existing_data.get("testScriptId"):
+    if not existing_data or not (existing_data.get("testScriptId") or existing_data.get("testScriptIdList")):
         return json.dumps({
             "error": f"Could not find test script or test data for ID {script_data_test_id}. Ensure you are passing a valid Class ID (from get_script_data) or Test ID."
         })
 
-    body = existing_data
+    body = dict(existing_data)
 
     # Step 3: Some endpoints still require the tests list, even if existing_data didn't contain it
     if not body.get("tests"):
-        # Let's try to fetch all tests for the class using the class ID if we have it
-        # Actually our update_existing_test_group fix showed that we need the exact tests we are replacing
-        pass
+        test_entries = await _get("/mcp/Testing/getScriptDataTest", {"testScriptDataId": script_data_test_id})
+        if test_entries and isinstance(test_entries, list):
+            body["tests"] = [
+                {"testName": t.get("name", ""), "scriptDataTest": t.get("id")}
+                for t in test_entries if t.get("id")
+            ]
 
     body["newCallIds"] = new_call_ids
 
@@ -895,7 +969,6 @@ async def regenerate_tests_by_call_for_test_script(
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
-@mcp.tool()
 async def auto_generate_tests_for_service(
     module_name: str,
     service_name: str,
@@ -1041,7 +1114,6 @@ async def auto_generate_tests_for_service(
     return "\n".join(lines)
 
 
-@mcp.tool()
 async def update_existing_test_group(
     test_script_id: str,
     module_name: str,
@@ -1123,7 +1195,7 @@ async def update_existing_test_group(
                 "serviceName": service_name,
                 "className": class_name,
                 "methodName": method_name,
-                "testScriptId": test_script_id,
+                "testScriptIdList": [test_script_id],
                 "callId": call_id,
                 "newCallIds": new_call_ids
             }
