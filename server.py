@@ -888,10 +888,105 @@ async def get_script_data_test(test_script_data_id: str) -> str:
     data = await _get("/mcp/Testing/getScriptDataTest", {"testScriptDataId": test_script_data_id})
     return json.dumps(data, ensure_ascii=False, default=str)
 
+async def _find_test_context(script_data_test_id: str):
+    """Resolve a method-level test ID to its parent script data and group via MCP-only APIs."""
+    all_groups = await _get("/mcp/Testing/getAllTestScript")
+
+    for group in all_groups or []:
+        group_id = group.get("id")
+        if not group_id:
+            continue
+
+        try:
+            script_data_entries = await _get("/mcp/Testing/getScriptData", {"testScriptId": group_id})
+        except Exception:
+            continue
+
+        for entry in script_data_entries or []:
+            entry_id = entry.get("id")
+            if not entry_id:
+                continue
+
+            try:
+                tests = await _get("/mcp/Testing/getScriptDataTest", {"testScriptDataId": entry_id})
+            except Exception:
+                continue
+
+            for test in tests or []:
+                if test.get("id") == script_data_test_id:
+                    return {
+                        "group_id": group_id,
+                        "script_data": entry,
+                        "target_test": test,
+                    }
+
+    return None
+
+
+async def _build_replace_payload(script_data_test_id: str) -> dict:
+    """Rebuild replace payload without relying on MCP getTestsByCallForTestScript."""
+    context = await _find_test_context(script_data_test_id)
+    if not context:
+        raise RuntimeError(
+            f"Could not resolve test id {script_data_test_id} through MCP-accessible APIs."
+        )
+
+    target_test = context["target_test"]
+    source_message_id = target_test.get("sourceMessageId")
+    if not source_message_id:
+        raise RuntimeError(
+            f"Test {script_data_test_id} does not expose sourceMessageId, cannot rebuild replace payload."
+        )
+
+    group_id = context["group_id"]
+    script_data_entries = await _get("/mcp/Testing/getScriptData", {"testScriptId": group_id})
+
+    aggregated_tests = []
+    seen_test_ids = set()
+    for entry in script_data_entries or []:
+        entry_id = entry.get("id")
+        if not entry_id:
+            continue
+
+        try:
+            tests = await _get("/mcp/Testing/getScriptDataTest", {"testScriptDataId": entry_id})
+        except Exception:
+            continue
+
+        for test in tests or []:
+            test_id = test.get("id")
+            if not test_id or test_id in seen_test_ids:
+                continue
+            if test.get("sourceMessageId") != source_message_id:
+                continue
+
+            aggregated_tests.append({
+                "testName": test.get("name", ""),
+                "scriptDataTest": test_id,
+            })
+            seen_test_ids.add(test_id)
+
+    if not aggregated_tests:
+        raise RuntimeError(
+            f"Could not rebuild test cluster for sourceMessageId {source_message_id}."
+        )
+
+    entrypoint = target_test.get("entrypoint") or {}
+    return {
+        "tests": aggregated_tests,
+        "moduleName": context["script_data"].get("moduleName"),
+        "serviceName": context["script_data"].get("serviceName"),
+        "className": entrypoint.get("beanClass") or context["script_data"].get("className"),
+        "methodName": entrypoint.get("method") or "",
+        "testScriptIdList": [group_id],
+        "testScriptId": group_id,
+        "callId": source_message_id,
+    }
+
 @mcp.tool()
 async def get_tests_by_call_for_test_script(script_data_test_id: str) -> str:
-    """Returns detailed tests information for a specific UI/method level."""
-    data = await _get("/mcp/Testing/getTestsByCallForTestScript", {"scriptDataTestId": script_data_test_id})
+    """Returns replace payload for a specific method-level test using MCP-only APIs."""
+    data = await _build_replace_payload(script_data_test_id)
     return json.dumps(data, ensure_ascii=False, default=str)
 
 @mcp.tool()
@@ -914,59 +1009,12 @@ async def regenerate_tests_by_call_for_test_script(
     script_data_test_id: str,
     new_call_ids: list[str]
 ) -> str:
-    """Replaces (regenerates) the tests for a specific method inside an existing test group.
-    This tool first fetches current test metadata and builds the tests list
-    from getScriptDataTest if it's missing (required by the backend).
-    Includes retry logic — test data may not be immediately available after generation.
-
-    Args:
-        script_data_test_id: The UUID of the specific method test (from get_script_data)
-        new_call_ids: List of new trace IDs to generate tests from
-    """
-    # Step 1: Check if the provided ID is actually a Class ID (ScriptData ID)
-    test_id_to_use = script_data_test_id
-    try:
-        # If it's a Class ID, this will return a list of tests
-        potential_tests = await _get("/mcp/Testing/getScriptDataTest", {"testScriptDataId": script_data_test_id})
-        if potential_tests and isinstance(potential_tests, list) and potential_tests[0].get("id"):
-            # It was a Class ID! We'll use the first test's ID to fetch the comprehensive payload
-            test_id_to_use = potential_tests[0].get("id")
-    except Exception:
-        pass
-
-    # Step 2: Fetch existing data/metadata
-    existing_data = None
-    for attempt in range(3):
-        try:
-            existing_data = await _get("/mcp/Testing/getTestsByCallForTestScript", {"scriptDataTestId": test_id_to_use})
-            if existing_data and (existing_data.get("testScriptId") or existing_data.get("testScriptIdList")):
-                break
-        except Exception:
-            pass
-        if attempt < 2:
-            await asyncio.sleep(3)
-
-    if not existing_data or not (existing_data.get("testScriptId") or existing_data.get("testScriptIdList")):
-        return json.dumps({
-            "error": f"Could not find test script or test data for ID {script_data_test_id}. Ensure you are passing a valid Class ID (from get_script_data) or Test ID."
-        })
-
-    body = dict(existing_data)
-
-    # Step 3: Some endpoints still require the tests list, even if existing_data didn't contain it
-    if not body.get("tests"):
-        test_entries = await _get("/mcp/Testing/getScriptDataTest", {"testScriptDataId": script_data_test_id})
-        if test_entries and isinstance(test_entries, list):
-            body["tests"] = [
-                {"testName": t.get("name", ""), "scriptDataTest": t.get("id")}
-                for t in test_entries if t.get("id")
-            ]
-
+    """Replaces a method test cluster using only MCP endpoints that are currently accessible."""
+    body = await _build_replace_payload(script_data_test_id)
     body["newCallIds"] = new_call_ids
-
-    # Step 4: Perform the regeneration
     data = await _post_json("/mcp/Testing/regenerateTestsByCallForTestScript", body)
     return json.dumps(data, ensure_ascii=False, default=str)
+
 
 
 async def auto_generate_tests_for_service(
