@@ -3,12 +3,15 @@
 BitDive MCP Server
 Proxies tool calls to BitDive monitoring API endpoints (/mcp/*)
 using X-BitDive-MCP-Token for authentication.
+
+Each tool accepts optional ``mcp_token``; if omitted, ``BITDIVE_MCP_TOKEN`` env is used.
 """
 import os
 import json
 import httpx
 import re
 import asyncio
+import inspect
 from collections import Counter
 from urllib.parse import parse_qsl, quote, unquote, urlparse, urlunparse
 from mcp.server.fastmcp import FastMCP
@@ -18,10 +21,8 @@ BITDIVE_API_URL = os.getenv(
     "BITDIVE_API_URL",
     "https://cloud.bitdive.io/monitoring-api"
 )
-BITDIVE_MCP_TOKEN = os.getenv(
-    "BITDIVE_MCP_TOKEN",
-    ""
-)
+# Default token when a tool call does not pass ``mcp_token``.
+BITDIVE_MCP_TOKEN = os.getenv("BITDIVE_MCP_TOKEN", "")
 BITDIVE_SKIP_VERIFY = os.getenv("BITDIVE_SKIP_VERIFY", "false").lower() == "true"
 TIMEOUT = 30.0
 
@@ -40,18 +41,24 @@ mcp = FastMCP(
 
 
 # ── HTTP helpers ────────────────────────────────────────────────
-def _auth_headers() -> dict[str, str]:
-    """Build auth headers and fail fast if the token is not configured."""
-    if not BITDIVE_MCP_TOKEN:
+def _resolve_mcp_token(mcp_token: str | None) -> str:
+    """Per-request token overrides ``BITDIVE_MCP_TOKEN`` when non-empty."""
+    t = (mcp_token or "").strip() or BITDIVE_MCP_TOKEN
+    if not t:
         raise RuntimeError(
-            "BITDIVE_MCP_TOKEN is not set. Export it before starting the MCP server."
+            "BitDive MCP token missing: pass `mcp_token` on the tool call "
+            "or set the BITDIVE_MCP_TOKEN environment variable."
         )
-    return {"X-BitDive-MCP-Token": BITDIVE_MCP_TOKEN}
+    return t
 
 
-async def _get(path: str, params: dict | None = None):
+def _auth_headers(mcp_token: str | None = None) -> dict[str, str]:
+    return {"X-BitDive-MCP-Token": _resolve_mcp_token(mcp_token)}
+
+
+async def _get(path: str, params: dict | None = None, mcp_token: str | None = None):
     """Make an authenticated GET request to BitDive API."""
-    headers = _auth_headers()
+    headers = _auth_headers(mcp_token)
     async with httpx.AsyncClient(timeout=TIMEOUT, verify=not BITDIVE_SKIP_VERIFY) as client:
         resp = await client.get(
             f"{BITDIVE_API_URL}{path}",
@@ -62,9 +69,11 @@ async def _get(path: str, params: dict | None = None):
         return resp.json()
 
 
-async def _post_json(path: str, body: dict, params: dict | None = None):
+async def _post_json(
+    path: str, body: dict, params: dict | None = None, mcp_token: str | None = None
+):
     """Make an authenticated POST request with JSON body to BitDive API."""
-    headers = _auth_headers()
+    headers = _auth_headers(mcp_token)
     async with httpx.AsyncClient(timeout=TIMEOUT, verify=not BITDIVE_SKIP_VERIFY) as client:
         resp = await client.post(
             f"{BITDIVE_API_URL}{path}",
@@ -78,9 +87,9 @@ async def _post_json(path: str, body: dict, params: dict | None = None):
         return {}
 
 
-async def _delete(path: str, params: dict | None = None):
+async def _delete(path: str, params: dict | None = None, mcp_token: str | None = None):
     """Make an authenticated DELETE request to BitDive API."""
-    headers = _auth_headers()
+    headers = _auth_headers(mcp_token)
     async with httpx.AsyncClient(timeout=TIMEOUT, verify=not BITDIVE_SKIP_VERIFY) as client:
         resp = await client.delete(
             f"{BITDIVE_API_URL}{path}",
@@ -560,34 +569,47 @@ def _format_heatmap(modules: list) -> str:
 
 
 @mcp.tool()
-async def get_heatmap_all_system(last_minutes: int = 10) -> str:
+async def get_heatmap_all_system(
+    last_minutes: int = 10, mcp_token: str | None = None
+) -> str:
     """Returns system performance metrics (heatmap) for ALL modules and services.
     Shows error counts, call counts, average response times,
     SQL/REST/Queue metrics for each module → service → class → method.
     """
     last_minutes = min(last_minutes, 30)
-    data = await _get("/mcp/Dashboard/HeatMap", {"LastMinutes": last_minutes})
+    data = await _get(
+        "/mcp/Dashboard/HeatMap", {"LastMinutes": last_minutes}, mcp_token=mcp_token
+    )
     return _format_heatmap(data)
 
 
 @mcp.tool()
-async def get_heatmap_for_module(module_name: str, last_minutes: int = 10) -> str:
+async def get_heatmap_for_module(
+    module_name: str, last_minutes: int = 10, mcp_token: str | None = None
+) -> str:
     """Returns performance metrics (heatmap) for a specific module.
     Filters the full heatmap to only the given module.
     """
     last_minutes = min(last_minutes, 30)
-    data = await _get("/mcp/Dashboard/HeatMap", {"LastMinutes": last_minutes})
+    data = await _get(
+        "/mcp/Dashboard/HeatMap", {"LastMinutes": last_minutes}, mcp_token=mcp_token
+    )
     filtered = [m for m in data if m.get("moduleName") == module_name]
     return _format_heatmap(filtered)
 
 
 @mcp.tool()
 async def get_heatmap_for_service(
-    module_name: str, service_name: str, last_minutes: int = 10
+    module_name: str,
+    service_name: str,
+    last_minutes: int = 10,
+    mcp_token: str | None = None,
 ) -> str:
     """Returns performance metrics (heatmap) for a specific module and service."""
     last_minutes = min(last_minutes, 30)
-    data = await _get("/mcp/Dashboard/HeatMap", {"LastMinutes": last_minutes})
+    data = await _get(
+        "/mcp/Dashboard/HeatMap", {"LastMinutes": last_minutes}, mcp_token=mcp_token
+    )
     filtered = []
     for m in data:
         if m.get("moduleName") == module_name:
@@ -605,15 +627,21 @@ async def get_heatmap_for_service(
 # ═══════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def get_last_calls(module_name: str, service_name: str) -> str:
+async def get_last_calls(
+    module_name: str, service_name: str, mcp_token: str | None = None
+) -> str:
     """Returns a list of recent method executions with their trace IDs
     for the given module and service. Use this to find call IDs
     for deeper trace investigation.
     """
-    data = await _get("/mcp/LastCallService/getData", {
-        "moduleName": module_name,
-        "serviceName": service_name,
-    })
+    data = await _get(
+        "/mcp/LastCallService/getData",
+        {
+            "moduleName": module_name,
+            "serviceName": service_name,
+        },
+        mcp_token=mcp_token,
+    )
     if not data or not isinstance(data, list):
         return "No recent calls found."
     lines = [f"Recent calls for {module_name}/{service_name}:\n"]
@@ -631,27 +659,36 @@ async def get_last_calls(module_name: str, service_name: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def find_trace_all(call_id: str) -> str:
+async def find_trace_all(call_id: str, mcp_token: str | None = None) -> str:
     """Returns the full call trace tree for the specified call ID.
     Shows the complete hierarchy of method calls, SQL queries,
     REST calls, and queue operations within a single request.
     """
-    data = await _get("/mcp/FindTrace/findTraceAll", {"callId": call_id})
+    data = await _get(
+        "/mcp/FindTrace/findTraceAll", {"callId": call_id}, mcp_token=mcp_token
+    )
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
 @mcp.tool()
 async def find_trace_for_method(
-    call_id: str, class_name: str, method_name: str
+    call_id: str,
+    class_name: str,
+    method_name: str,
+    mcp_token: str | None = None,
 ) -> str:
     """Returns the call trace for a specific method within the given call ID.
     Use this to drill down into a particular method's execution details.
     """
-    data = await _get("/mcp/FindTrace/findTraceForMethod", {
-        "callId": call_id,
-        "className": class_name,
-        "methodName": method_name,
-    })
+    data = await _get(
+        "/mcp/FindTrace/findTraceForMethod",
+        {
+            "callId": call_id,
+            "className": class_name,
+            "methodName": method_name,
+        },
+        mcp_token=mcp_token,
+    )
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
@@ -661,22 +698,29 @@ async def find_trace_between_time(
     method_name: str,
     begin_date: str,
     end_date: str,
+    mcp_token: str | None = None,
 ) -> str:
     """Returns method call traces between two timestamps.
     Dates must be in ISO-8601 format with timezone offset,
     e.g. '2024-01-15T10:30:00+03:00'.
     """
-    data = await _get("/mcp/FindTrace/findTraceForMethodBetweenTime", {
-        "className": class_name,
-        "methodName": method_name,
-        "beginDate": begin_date,
-        "endDate": end_date,
-    })
+    data = await _get(
+        "/mcp/FindTrace/findTraceForMethodBetweenTime",
+        {
+            "className": class_name,
+            "methodName": method_name,
+            "beginDate": begin_date,
+            "endDate": end_date,
+        },
+        mcp_token=mcp_token,
+    )
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
 @mcp.tool()
-async def get_trace_names_batch(call_ids: list[str]) -> str:
+async def get_trace_names_batch(
+    call_ids: list[str], mcp_token: str | None = None
+) -> str:
     """Takes a list of trace call IDs and returns a quick mapping 
     of each ID to its short className and methodName.
     Use this to quickly identify unknown call IDs (e.g. from test script groups).
@@ -690,7 +734,11 @@ async def get_trace_names_batch(call_ids: list[str]) -> str:
     results = []
     for cid in call_ids:
         try:
-            data = await _get("/mcp/FindTrace/findTraceAll", {"callId": cid})
+            data = await _get(
+                "/mcp/FindTrace/findTraceAll",
+                {"callId": cid},
+                mcp_token=mcp_token,
+            )
             if data:
                 c_name = data.get("className", "?").split('.')[-1]
                 m_name = data.get("methodName", "?")
@@ -704,11 +752,15 @@ async def get_trace_names_batch(call_ids: list[str]) -> str:
 
 
 @mcp.tool()
-async def get_reproduction_command(call_id: str) -> str:
+async def get_reproduction_command(
+    call_id: str, mcp_token: str | None = None
+) -> str:
     """Returns a curl command and structured info to reproduce the web request from a trace.
     Extracts URL, method, headers, and body from the recorded BitDive trace.
     """
-    trace = await _get("/mcp/FindTrace/findTraceAll", {"callId": call_id})
+    trace = await _get(
+        "/mcp/FindTrace/findTraceAll", {"callId": call_id}, mcp_token=mcp_token
+    )
     
     op_type = trace.get("operationType", "WEB_GET")
     method = op_type.replace("WEB_", "") if op_type.startswith("WEB_") else "GET"
@@ -784,26 +836,38 @@ async def get_reproduction_command(call_id: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def search_methods_short(query: str, limit: int = 10) -> str:
+async def search_methods_short(
+    query: str, limit: int = 10, mcp_token: str | None = None
+) -> str:
     """Search for method documentation by query string.
     Returns short summaries of matching methods.
     """
-    data = await _get("/mcp/MethodDoc/searchShort", {
-        "q": query,
-        "limit": limit,
-    })
+    data = await _get(
+        "/mcp/MethodDoc/searchShort",
+        {
+            "q": query,
+            "limit": limit,
+        },
+        mcp_token=mcp_token,
+    )
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
 @mcp.tool()
-async def search_methods_full(query: str, limit: int = 3) -> str:
+async def search_methods_full(
+    query: str, limit: int = 3, mcp_token: str | None = None
+) -> str:
     """Search for method documentation by query string.
     Returns full details including call statistics and trace info.
     """
-    data = await _get("/mcp/MethodDoc/searchFull", {
-        "q": query,
-        "limit": limit,
-    })
+    data = await _get(
+        "/mcp/MethodDoc/searchFull",
+        {
+            "q": query,
+            "limit": limit,
+        },
+        mcp_token=mcp_token,
+    )
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
@@ -817,6 +881,7 @@ async def create_test_group(
     name: str,
     test_type: str,
     call_id_list: list[str],
+    mcp_token: str | None = None,
 ) -> str:
     """Creates a NEW test group in BitDive from a list of call (trace) IDs.
 
@@ -838,13 +903,15 @@ async def create_test_group(
             "callIdList": call_id_list
         }
     }
-    data = await _post_json("/mcp/Testing/createTestGroup", body)
+    data = await _post_json(
+        "/mcp/Testing/createTestGroup", body, mcp_token=mcp_token
+    )
     return json.dumps(data, ensure_ascii=False, default=str)
 
 @mcp.tool()
-async def get_all_test_scripts() -> str:
+async def get_all_test_scripts(mcp_token: str | None = None) -> str:
     """Returns all test scripts (test groups) from the system."""
-    data = await _get("/mcp/Testing/getAllTestScript")
+    data = await _get("/mcp/Testing/getAllTestScript", mcp_token=mcp_token)
     if not data or not isinstance(data, list):
         return "No test scripts found."
     lines = [f"Test Scripts ({len(data)} total):\n"]
@@ -863,9 +930,15 @@ async def get_all_test_scripts() -> str:
     return "\n".join(lines)
 
 @mcp.tool()
-async def get_script_data(test_script_id: str) -> str:
+async def get_script_data(
+    test_script_id: str, mcp_token: str | None = None
+) -> str:
     """Returns script data for a given test group ID."""
-    data = await _get("/mcp/Testing/getScriptData", {"testScriptId": test_script_id})
+    data = await _get(
+        "/mcp/Testing/getScriptData",
+        {"testScriptId": test_script_id},
+        mcp_token=mcp_token,
+    )
     if not data or not isinstance(data, list):
         return "No script data found."
     lines = [f"Script data for {test_script_id} ({len(data)} entries):\n"]
@@ -882,14 +955,22 @@ async def get_script_data(test_script_id: str) -> str:
     return "\n".join(lines)
 
 @mcp.tool()
-async def get_script_data_test(test_script_data_id: str) -> str:
+async def get_script_data_test(
+    test_script_data_id: str, mcp_token: str | None = None
+) -> str:
     """Returns the tests under a specific script data record."""
-    data = await _get("/mcp/Testing/getScriptDataTest", {"testScriptDataId": test_script_data_id})
+    data = await _get(
+        "/mcp/Testing/getScriptDataTest",
+        {"testScriptDataId": test_script_data_id},
+        mcp_token=mcp_token,
+    )
     return json.dumps(data, ensure_ascii=False, default=str)
 
-async def _find_test_context(script_data_test_id: str):
+async def _find_test_context(
+    script_data_test_id: str, mcp_token: str | None = None
+):
     """Resolve a method-level test ID to its parent script data and group via MCP-only APIs."""
-    all_groups = await _get("/mcp/Testing/getAllTestScript")
+    all_groups = await _get("/mcp/Testing/getAllTestScript", mcp_token=mcp_token)
 
     for group in all_groups or []:
         group_id = group.get("id")
@@ -897,7 +978,11 @@ async def _find_test_context(script_data_test_id: str):
             continue
 
         try:
-            script_data_entries = await _get("/mcp/Testing/getScriptData", {"testScriptId": group_id})
+            script_data_entries = await _get(
+                "/mcp/Testing/getScriptData",
+                {"testScriptId": group_id},
+                mcp_token=mcp_token,
+            )
         except Exception:
             continue
 
@@ -907,7 +992,11 @@ async def _find_test_context(script_data_test_id: str):
                 continue
 
             try:
-                tests = await _get("/mcp/Testing/getScriptDataTest", {"testScriptDataId": entry_id})
+                tests = await _get(
+                    "/mcp/Testing/getScriptDataTest",
+                    {"testScriptDataId": entry_id},
+                    mcp_token=mcp_token,
+                )
             except Exception:
                 continue
 
@@ -922,9 +1011,11 @@ async def _find_test_context(script_data_test_id: str):
     return None
 
 
-async def _build_replace_payload(script_data_test_id: str) -> dict:
+async def _build_replace_payload(
+    script_data_test_id: str, mcp_token: str | None = None
+) -> dict:
     """Rebuild replace payload without relying on MCP getTestsByCallForTestScript."""
-    context = await _find_test_context(script_data_test_id)
+    context = await _find_test_context(script_data_test_id, mcp_token=mcp_token)
     if not context:
         raise RuntimeError(
             f"Could not resolve test id {script_data_test_id} through MCP-accessible APIs."
@@ -938,7 +1029,11 @@ async def _build_replace_payload(script_data_test_id: str) -> dict:
         )
 
     group_id = context["group_id"]
-    script_data_entries = await _get("/mcp/Testing/getScriptData", {"testScriptId": group_id})
+    script_data_entries = await _get(
+        "/mcp/Testing/getScriptData",
+        {"testScriptId": group_id},
+        mcp_token=mcp_token,
+    )
 
     aggregated_tests = []
     seen_test_ids = set()
@@ -948,7 +1043,11 @@ async def _build_replace_payload(script_data_test_id: str) -> dict:
             continue
 
         try:
-            tests = await _get("/mcp/Testing/getScriptDataTest", {"testScriptDataId": entry_id})
+            tests = await _get(
+                "/mcp/Testing/getScriptDataTest",
+                {"testScriptDataId": entry_id},
+                mcp_token=mcp_token,
+            )
         except Exception:
             continue
 
@@ -983,46 +1082,66 @@ async def _build_replace_payload(script_data_test_id: str) -> dict:
     }
 
 @mcp.tool()
-async def get_tests_by_call_for_test_script(script_data_test_id: str) -> str:
+async def get_tests_by_call_for_test_script(
+    script_data_test_id: str, mcp_token: str | None = None
+) -> str:
     """Returns replace payload for a specific method-level test using MCP-only APIs."""
-    data = await _build_replace_payload(script_data_test_id)
+    data = await _build_replace_payload(script_data_test_id, mcp_token=mcp_token)
     return json.dumps(data, ensure_ascii=False, default=str)
 
 @mcp.tool()
-async def delete_test_script(test_script_id: str) -> str:
+async def delete_test_script(
+    test_script_id: str, mcp_token: str | None = None
+) -> str:
     """Deletes an entire test script (group)."""
-    data = await _delete("/mcp/Testing/deleteTestScript", {"testScriptId": test_script_id})
+    data = await _delete(
+        "/mcp/Testing/deleteTestScript",
+        {"testScriptId": test_script_id},
+        mcp_token=mcp_token,
+    )
     return json.dumps(data, ensure_ascii=False, default=str)
 
 @mcp.tool()
-async def enabled_test_script(test_script_id: str, enabled: bool = True) -> str:
+async def enabled_test_script(
+    test_script_id: str, enabled: bool = True, mcp_token: str | None = None
+) -> str:
     """Enables or disables a test script."""
     data = await _post_json(
-        "/mcp/Testing/enabledTestScript", {},
+        "/mcp/Testing/enabledTestScript",
+        {},
         params={"testScriptId": test_script_id, "enabled": str(enabled).lower()},
+        mcp_token=mcp_token,
     )
     return json.dumps(data, ensure_ascii=False, default=str)
 
 @mcp.tool(description="Regenerate tests for a script using a new set of call IDs")
 async def regenerate_tests_by_call_for_test_script(
     script_data_test_id: str,
-    new_call_ids: list[str]
+    new_call_ids: list[str],
+    mcp_token: str | None = None,
 ) -> str:
     dto = await _get(
         "/mcp/Testing/getTestsByCallForTestScript",
         {"scriptDataTestId": script_data_test_id},
+        mcp_token=mcp_token,
     )
     if not isinstance(dto, dict):
         raise RuntimeError(
             f"getTestsByCallForTestScript returned unexpected data for scriptDataTestId={script_data_test_id!r}"
         )
     body = {**dto, "newCallIds": new_call_ids}
-    data = await _post_json("/mcp/Testing/regenerateTestsByCallForTestScript", body)
+    data = await _post_json(
+        "/mcp/Testing/regenerateTestsByCallForTestScript",
+        body,
+        mcp_token=mcp_token,
+    )
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
 @mcp.tool()
-async def get_test_failure_details(test_script_id: str) -> str:
+async def get_test_failure_details(
+    test_script_id: str, mcp_token: str | None = None
+) -> str:
     """Returns a summary of all test results for a test script.
     Shows which classes passed/failed and provides details for failures.
     Use this to understand WHY tests failed without opening BitDive UI.
@@ -1030,7 +1149,11 @@ async def get_test_failure_details(test_script_id: str) -> str:
     Args:
         test_script_id: UUID of the test group
     """
-    script_data = await _get("/mcp/Testing/getScriptData", {"testScriptId": test_script_id})
+    script_data = await _get(
+        "/mcp/Testing/getScriptData",
+        {"testScriptId": test_script_id},
+        mcp_token=mcp_token,
+    )
     if not script_data:
         return json.dumps({"error": f"Test script {test_script_id} not found"})
 
@@ -1059,7 +1182,11 @@ async def get_test_failure_details(test_script_id: str) -> str:
             # Try to get detailed failure info
             entry_id = entry.get("id", "")
             try:
-                detail = await _get("/mcp/Testing/getTestsByCallForTestScript", {"scriptDataTestId": entry_id})
+                detail = await _get(
+                    "/mcp/Testing/getTestsByCallForTestScript",
+                    {"scriptDataTestId": entry_id},
+                    mcp_token=mcp_token,
+                )
                 if detail and detail.get("tests"):
                     for test in detail["tests"][:2]:  # Show first 2 tests max
                         test_name = test.get("name", "?")[:80]
@@ -1081,7 +1208,9 @@ async def get_test_failure_details(test_script_id: str) -> str:
 
 
 @mcp.tool()
-async def compare_trace_evolution(call_ids: list[str]) -> str:
+async def compare_trace_evolution(
+    call_ids: list[str], mcp_token: str | None = None
+) -> str:
     """Compares N traces chronologically to show the evolution of a method.
     Useful for tracking how a method changed across multiple deployments.
     Pass call IDs in chronological order (oldest first).
@@ -1095,7 +1224,11 @@ async def compare_trace_evolution(call_ids: list[str]) -> str:
     # Fetch all traces
     traces = []
     for cid in call_ids:
-        trace = await _get("/mcp/FindTrace/findTraceAll", {"callId": cid})
+        trace = await _get(
+            "/mcp/FindTrace/findTraceAll",
+            {"callId": cid},
+            mcp_token=mcp_token,
+        )
         traces.append(trace)
     
     def _extract_metrics(trace):
@@ -1367,25 +1500,41 @@ def _build_summary(trace: dict) -> str:
 
 
 @mcp.tool()
-async def find_trace_summary(call_id: str) -> str:
+async def find_trace_summary(
+    call_id: str, mcp_token: str | None = None
+) -> str:
     """Returns a human-readable summary of a call trace.
     Shows the execution tree with method names, timings, SQL queries,
     REST calls, return values, and errors in a compact format.
     Use this instead of find_trace_all when you need to understand
     what a method does without parsing raw JSON.
     """
-    data = await _get("/mcp/FindTrace/findTraceAll", {"callId": call_id})
+    data = await _get(
+        "/mcp/FindTrace/findTraceAll", {"callId": call_id}, mcp_token=mcp_token
+    )
     return _build_summary(data)
 
 
 @mcp.tool()
-async def compare_traces(before_call_id: str, after_call_id: str) -> str:
+async def compare_traces(
+    before_call_id: str,
+    after_call_id: str,
+    mcp_token: str | None = None,
+) -> str:
     """Compares two call traces side-by-side (BEFORE vs AFTER).
     Shows differences in timing, SQL queries, child calls, and errors.
     Use after making a code change to verify the impact.
     """
-    before = await _get("/mcp/FindTrace/findTraceAll", {"callId": before_call_id})
-    after = await _get("/mcp/FindTrace/findTraceAll", {"callId": after_call_id})
+    before = await _get(
+        "/mcp/FindTrace/findTraceAll",
+        {"callId": before_call_id},
+        mcp_token=mcp_token,
+    )
+    after = await _get(
+        "/mcp/FindTrace/findTraceAll",
+        {"callId": after_call_id},
+        mcp_token=mcp_token,
+    )
     before_contracts = _build_contract_entries(before) if before else []
     after_contracts = _build_contract_entries(after) if after else []
 
@@ -1633,5 +1782,27 @@ async def compare_traces(before_call_id: str, after_call_id: str) -> str:
 
 
 # ── Entry point ─────────────────────────────────────────────────
+def _run_streamable_http(host: str, port: int) -> None:
+    """Bind host/port on both new mcp (run accepts host/port) and older mcp (uvicorn)."""
+    sig = inspect.signature(mcp.run)
+    if "host" in sig.parameters:
+        mcp.run(transport="streamable-http", host=host, port=port)
+        return
+    app_factory = getattr(mcp, "streamable_http_app", None)
+    if app_factory is not None:
+        import uvicorn
+
+        app = app_factory()
+        uvicorn.run(app, host=host, port=port)
+        return
+    mcp.run(transport="streamable-http")
+
+
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    transport = os.getenv("MCP_TRANSPORT", "stdio").strip().lower()
+    if transport in ("streamable-http", "http"):
+        host = os.getenv("MCP_HOST", "0.0.0.0")
+        port = int(os.getenv("MCP_PORT", "8000"))
+        _run_streamable_http(host, port)
+    else:
+        mcp.run(transport="stdio")
