@@ -50,13 +50,13 @@ This is the only required connection pattern:
 
 ## Available Tools
 
-The server exposes the following MCP tools.
+The server currently exposes 23 MCP tools.
 
 ### Discovery
 
-- `get_heatmap_all_system`: shows modules, services, entrypoints, error counts, SQL activity, REST activity, and average timings across the whole system
-- `get_heatmap_for_module`: same heatmap view filtered to one module
-- `get_heatmap_for_service`: same heatmap view filtered to one module and one service
+- `get_heatmap_all_system(last_minutes)`: shows modules, services, entrypoints, error counts, SQL activity, REST activity, and average timings across the whole system
+- `get_heatmap_for_module(module_name, last_minutes)`: same heatmap view filtered to one module
+- `get_heatmap_for_service(module_name, service_name, last_minutes)`: same heatmap view filtered to one module and one service
 
 Use these when you need to discover the real module, service, class, or method names before looking up traces.
 
@@ -96,16 +96,23 @@ Use these when you know only a keyword, business term, or partial method name.
 - `get_all_test_scripts()`: lists all BitDive test groups
 - `get_script_data(test_script_id)`: lists class-level entries inside one test group
 - `get_script_data_test(test_script_data_id)`: lists method-level tests for one class entry
-- `get_tests_by_call_for_test_script(script_data_test_id)`: returns detailed generated-test payloads for one entry
+- `get_tests_by_call_for_test_script(script_data_test_id)`: rebuilds the replace payload for one method-level test using MCP-accessible APIs
 - `get_test_failure_details(test_script_id)`: summarizes pass/fail results and available failure details
 - `create_test_group(name, test_type, call_id_list)`: creates a new BitDive test group from trace IDs
 - `enabled_test_script(test_script_id, enabled)`: enables or disables a test group
 - `delete_test_script(test_script_id)`: deletes a test group
-- `regenerate_tests_by_call_for_test_script(script_data_test_id, new_call_ids)`: refreshes one method or class entry with new trace data
-- `update_existing_test_group(test_script_id, module_name, service_name, new_call_ids)`: refreshes an existing group with latest or supplied trace IDs
-- `auto_generate_tests_for_service(module_name, service_name, test_name, test_type)`: creates a new group using the latest trace for each discovered method in a service
+- `regenerate_tests_by_call_for_test_script(script_data_test_id, new_call_ids)`: regenerates one method-level test entry with replacement trace data
 
 Prefer refreshing existing test groups when behavior changed intentionally. Create a new group only when you actually need a new baseline set.
+
+## Tool Metadata
+
+Each tool now exposes:
+
+- a short MCP `description` in the decorator
+- per-parameter descriptions via JSON Schema generated from `Annotated[..., Field(description=...)]`
+
+This makes MCP clients show clearer tool help and parameter hints in the UI.
 
 ## Local Run
 
