@@ -15,6 +15,7 @@ import inspect
 from collections import Counter
 from urllib.parse import parse_qsl, quote, unquote, urlparse, urlunparse
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # ── Configuration ───────────────────────────────────────────────
 BITDIVE_API_URL = os.getenv(
@@ -36,6 +37,9 @@ mcp = FastMCP(
         "2. FIND TRACE: Once you know the exact className and methodName from the heatmap, use find_trace_between_time to fetch historical call_ids.\n"
         "3. REPRODUCE: Pass the call_id to get_reproduction_command to get a CURL/PowerShell command to manually trigger the endpoint.\n"
         "4. UPDATE CACHE: Execute the reproduction command, wait 45s, and the trace will be in the hot cache (get_last_calls) ready for test generation."
+    ),
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
     ),
 )
 

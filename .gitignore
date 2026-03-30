@@ -5,6 +5,7 @@ __pycache__/
 .mypy_cache/
 .env
 .env.*
+!.env.example
 debug_scripts/
 .idea/
 .agents/
