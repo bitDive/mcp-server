@@ -1,30 +1,132 @@
 # BitDive MCP Server
 
-MCP server for BitDive monitoring and QA tools. The repository is intentionally simple: one Python entry point, [`server.py`](./server.py), which exposes BitDive API operations over MCP `stdio`.
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](#requirements)
+[![MCP](https://img.shields.io/badge/MCP-FastMCP-111111)](#running-the-server)
+[![Transport](https://img.shields.io/badge/Transport-stdio%20%7C%20streamable--http-0A7EA4)](#running-the-server)
+[![BitDive](https://img.shields.io/badge/BitDive-Monitoring%20API-1F6FEB)](https://cloud.bitdive.io/monitoring-api)
 
-## What This Repository Contains
+Python MCP server for BitDive trace analysis, request reproduction, and regression management.
 
-- [`server.py`](./server.py): the MCP server
-- [`bitdive.mcp.json`](./bitdive.mcp.json): example MCP client config
-- [`openapi.json`](./openapi.json): reference API schema snapshot
+This repository exposes BitDive monitoring and QA operations to MCP clients such as Cursor, Claude Desktop, and other agent runtimes. The implementation lives in `server.py` and connects to the BitDive Monitoring API while adding its own formatting, normalization, and comparison logic on top.
+
+> Use this repository from the `python-mcp-server` branch.
+
+## Overview
+
+This server is not just a thin API proxy.
+
+It wraps BitDive API endpoints and makes them usable for agent workflows:
+
+- compact heatmap summaries for discovery
+- readable trace summaries instead of raw JSON only
+- Bash and PowerShell reproduction commands from captured requests
+- before/after trace comparison with payload and contract drift reporting
+- SQL normalization and volatile-field filtering to reduce noisy diffs
+- test-group inspection and regression-management flows
+
+## What It Is For
+
+Use this server when an AI agent or developer needs to:
+
+- discover which module, service, class, or entrypoint is active
+- fetch recent or historical traces
+- inspect a trace without manually parsing BitDive JSON
+- reproduce a captured web request locally
+- compare two traces after a code change
+- track how behavior evolved across multiple runs
+- inspect and update BitDive test groups
+
+## Tool Inventory
+
+The current server exposes 23 MCP tools.
+
+| Group | Tools |
+| --- | --- |
+| Discovery | `get_heatmap_all_system`, `get_heatmap_for_module`, `get_heatmap_for_service` |
+| Recent traces | `get_last_calls` |
+| Trace lookup | `find_trace_all`, `find_trace_for_method`, `find_trace_between_time`, `get_trace_names_batch` |
+| Reproduction | `get_reproduction_command` |
+| Method docs | `search_methods_short`, `search_methods_full` |
+| Test management | `create_test_group`, `get_all_test_scripts`, `get_script_data`, `get_script_data_test`, `get_tests_by_call_for_test_script`, `delete_test_script`, `enabled_test_script`, `regenerate_tests_by_call_for_test_script`, `get_test_failure_details` |
+| Trace intelligence | `find_trace_summary`, `compare_traces`, `compare_trace_evolution` |
+
+## What The Code Adds
+
+Several important behaviors are implemented inside `server.py`, not just delegated to the backend API.
+
+### Trace readability
+
+- `find_trace_summary` builds a readable execution tree
+- SQL, REST, queue calls, timings, return values, and errors are formatted for direct MCP output
+
+### Trace comparison
+
+- `compare_traces` detects method-path drift
+- payload and contract changes are compared after normalizing Java-serialized structures
+- volatile fields such as IDs, UUIDs, timestamps, `traceId`, and `callId` can be ignored for cleaner diffs
+- SQL execution deltas are grouped and normalized to surface likely N+1 patterns
+
+### Reproduction workflow
+
+- captured request URLs are normalized so internal Docker hostnames can be replayed from the host shell
+- `curl` and PowerShell commands are generated from recorded headers, method, URL, and body
+
+### Test-management helpers
+
+- the server can rebuild replacement payloads through MCP-accessible APIs when direct helper data is not available
+- test-group inspection is formatted for quick agent use instead of raw response browsing
+
+## Runtime Model
+
+| Layer | Responsibility |
+| --- | --- |
+| BitDive backend | Stores traces, monitoring data, and test metadata |
+| `mcp-server` | Exposes MCP tools and adds comparison, normalization, and formatting logic |
+| MCP client | Cursor, Claude Desktop, or another runtime invoking the tools |
 
 ## Requirements
 
-- Python 3.11 or newer
-- Installed Python packages required by [`server.py`](./server.py)
-- A valid BitDive MCP token
+- Python 3.11+
+- `httpx`
+- `mcp`
+- a valid BitDive MCP token
 
-If the required packages are not installed yet:
+Install dependencies:
 
-```powershell
+```bash
 pip install -r requirements.txt
 ```
 
-## MCP Client Setup
+## Configuration
 
-The normal usage pattern is to point your MCP client directly at [`server.py`](./server.py).
+### Environment variables
 
-Example configuration:
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `BITDIVE_MCP_TOKEN` | Default token when a tool call does not pass `mcp_token` | none |
+| `BITDIVE_API_URL` | Base BitDive Monitoring API URL | `https://cloud.bitdive.io/monitoring-api` |
+| `BITDIVE_SKIP_VERIFY` | Disable TLS certificate verification when set to `true` | `false` |
+| `MCP_TRANSPORT` | MCP transport mode | `stdio` |
+| `MCP_HOST` | Host for HTTP mode | `0.0.0.0` |
+| `MCP_PORT` | Port for HTTP mode | `8000` |
+
+Every tool also accepts an optional `mcp_token` parameter. If omitted, the server falls back to `BITDIVE_MCP_TOKEN`.
+
+## Running The Server
+
+### `stdio` mode
+
+```bash
+python server.py
+```
+
+### `streamable-http` mode
+
+```bash
+MCP_TRANSPORT=streamable-http MCP_HOST=0.0.0.0 MCP_PORT=8000 python server.py
+```
+
+## Example MCP Client Configuration
 
 ```json
 {
@@ -42,92 +144,15 @@ Example configuration:
 }
 ```
 
-This is the only required connection pattern:
+## Repository Contents
 
-- `command`: Python executable available in your environment
-- `args[0]`: absolute path to `server.py`
-- `env.BITDIVE_MCP_TOKEN`: your BitDive token
-
-## Available Tools
-
-The server currently exposes 23 MCP tools.
-
-### Discovery
-
-- `get_heatmap_all_system(last_minutes)`: shows modules, services, entrypoints, error counts, SQL activity, REST activity, and average timings across the whole system
-- `get_heatmap_for_module(module_name, last_minutes)`: same heatmap view filtered to one module
-- `get_heatmap_for_service(module_name, service_name, last_minutes)`: same heatmap view filtered to one module and one service
-
-Use these when you need to discover the real module, service, class, or method names before looking up traces.
-
-### Trace Lookup
-
-- `get_last_calls(module_name, service_name)`: returns recent call IDs for a service
-- `find_trace_between_time(class_name, method_name, begin_date, end_date)`: finds historical traces for one method in a time range
-- `get_trace_names_batch(call_ids)`: maps trace IDs to short `Class.method` names
-- `get_reproduction_command(call_id)`: reconstructs curl and PowerShell commands from a captured request
-
-Use these to find the exact trace you want to inspect or replay.
-
-### Trace Inspection
-
-- `find_trace_all(call_id)`: returns the full raw trace JSON
-- `find_trace_for_method(call_id, class_name, method_name)`: returns one method subtree from a trace
-- `find_trace_summary(call_id)`: returns a readable execution tree with timings, SQL, REST calls, queue calls, return values, and errors
-
-Use `find_trace_summary` by default. Use raw JSON only when you need full payload details.
-
-### Trace Comparison
-
-- `compare_traces(before_call_id, after_call_id)`: compares two traces and shows timing changes, new or removed method calls, SQL drift, REST drift, errors, and likely N+1 patterns
-- `compare_trace_evolution(call_ids)`: compares multiple traces in chronological order to show how a method changed over time
-
-These tools are the fastest way to prove what changed after a code modification.
-
-### Method Search
-
-- `search_methods_short(query, limit)`: lightweight search for documented methods
-- `search_methods_full(query, limit)`: fuller method search with more detailed metadata
-
-Use these when you know only a keyword, business term, or partial method name.
-
-### Test Management
-
-- `get_all_test_scripts()`: lists all BitDive test groups
-- `get_script_data(test_script_id)`: lists class-level entries inside one test group
-- `get_script_data_test(test_script_data_id)`: lists method-level tests for one class entry
-- `get_tests_by_call_for_test_script(script_data_test_id)`: rebuilds the replace payload for one method-level test using MCP-accessible APIs
-- `get_test_failure_details(test_script_id)`: summarizes pass/fail results and available failure details
-- `create_test_group(name, test_type, call_id_list)`: creates a new BitDive test group from trace IDs
-- `enabled_test_script(test_script_id, enabled)`: enables or disables a test group
-- `delete_test_script(test_script_id)`: deletes a test group
-- `regenerate_tests_by_call_for_test_script(script_data_test_id, new_call_ids)`: regenerates one method-level test entry with replacement trace data
-
-Prefer refreshing existing test groups when behavior changed intentionally. Create a new group only when you actually need a new baseline set.
-
-## Tool Metadata
-
-Each tool now exposes:
-
-- a short MCP `description` in the decorator
-- per-parameter descriptions via JSON Schema generated from `Annotated[..., Field(description=...)]`
-
-This makes MCP clients show clearer tool help and parameter hints in the UI.
-
-## Local Run
-
-You can also start the server directly:
-
-```powershell
-python server.py
-```
-
-In practice, it is usually launched by Cursor, Antigravity, or another MCP client.
+| Path | Purpose |
+| --- | --- |
+| `server.py` | MCP server implementation |
+| `requirements.txt` | Python dependencies |
 
 ## Notes
 
-- `BITDIVE_MCP_TOKEN` is required. The server fails fast if it is missing.
-- Do not commit a real token to a public repository.
-- [`bitdive.mcp.json`](./bitdive.mcp.json) is a local example, not a safe public secret store.
-- [`openapi.json`](./openapi.json) is kept only as a reference snapshot.
-- Trace indexing can lag after a fresh manual request. If a new trace does not appear immediately, wait about 30-45 seconds and retry.
+- The server fails fast if no MCP token is available.
+- Fresh traces may not appear in the hot cache immediately after replay; the built-in workflow expects a short wait before checking recent calls again.
+- This repository is the MCP bridge and trace-intelligence layer. It does not capture JVM events itself and it does not execute JUnit replay tests by itself.
