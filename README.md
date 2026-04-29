@@ -11,6 +11,14 @@ This repository exposes BitDive monitoring and QA operations to MCP clients such
 
 > Use this repository from the `python-mcp-server` branch.
 
+## Demo
+
+[![Watch the BitDive demo](https://img.youtube.com/vi/WqtLXcODz8I/maxresdefault.jpg)](https://www.youtube.com/watch?v=WqtLXcODz8I)
+
+Watch the BitDive product demo on YouTube:
+
+- https://www.youtube.com/watch?v=WqtLXcODz8I
+
 ## Overview
 
 This server is not just a thin API proxy.
