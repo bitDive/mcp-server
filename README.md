@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](#requirements)
 [![MCP](https://img.shields.io/badge/MCP-FastMCP-111111)](#running-the-server)
 [![Transport](https://img.shields.io/badge/Transport-stdio%20%7C%20streamable--http-0A7EA4)](#running-the-server)
-[![BitDive](https://img.shields.io/badge/BitDive-Monitoring%20API-1F6FEB)](https://cloud.bitdive.io/monitoring-api)
+[![BitDive](https://img.shields.io/badge/BitDive-Monitoring%20API-1F6FEB)](https://bitdive.io/)
 
 Python MCP server for BitDive trace analysis, request reproduction, and regression management.
 
