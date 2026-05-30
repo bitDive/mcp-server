@@ -34,11 +34,24 @@ mcp = FastMCP(
     "BitDive",
     instructions=(
         "BitDive monitoring and tracing MCP server.\n\n"
-        "CRITICAL WORKFLOW FOR DISCOVERING AND REPRODUCING TRACES:\n"
-        "1. DISCOVERY: If you need a method signature, ALWAYS use get_heatmap_all_system or get_heatmap_for_module. It returns all methods (even with 0 calls).\n"
-        "2. FIND TRACE: Once you know the exact className and methodName from the heatmap, use find_trace_between_time to fetch historical call_ids.\n"
-        "3. REPRODUCE: Pass the call_id to get_reproduction_command to get a CURL/PowerShell command to manually trigger the endpoint.\n"
-        "4. UPDATE CACHE: Execute the reproduction command, wait 45s, and the trace will be in the hot cache (get_last_calls) ready for test generation."
+        "TOOL NAMING: discovery tools (you do NOT have an id yet) start with "
+        "get_*_heatmap / list_* / find_* / search_*. Trace tools (you ALREADY "
+        "have a call_id) start with get_trace*. Use compare_* to diff traces.\n\n"
+        "TYPICAL WORKFLOW:\n"
+        "1. DISCOVER: get_system_heatmap or get_module_heatmap to find a method "
+        "signature (returns all methods, even with 0 calls).\n"
+        "2. FIND CALLS: with className + methodName, use find_calls_by_method to "
+        "fetch historical call_ids; list_recent_calls returns the latest "
+        "call_ids for a module/service.\n"
+        "3. INSPECT A TRACE (you have a call_id): get_trace_overview for a "
+        "readable tree; get_trace for the full de-noised tree (default for deep "
+        "analysis); get_trace_raw only when you need the untouched dump; "
+        "get_trace_subtree for one class.method inside a call.\n"
+        "4. COMPARE: compare_traces for before/after; compare_traces_over_time "
+        "for a chronological series.\n"
+        "5. REPRODUCE: pass a call_id to get_replay_command for a "
+        "CURL/PowerShell command. Run it, wait ~45s, and the trace appears in "
+        "list_recent_calls."
     ),
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=False
@@ -251,6 +264,42 @@ def _redact_payload(value, key_path: str = ""):
             return "<REDACTED>"
         return _redact_string(value)
     return value
+
+
+def _redact_trace(trace):
+    """Redact tokens/secrets across an entire raw trace tree.
+
+    Applied to the source-of-truth tools (``get_trace_raw`` /
+    ``get_trace_subtree``) so bearer tokens, JWTs, cookies, and
+    credential-bearing headers/bodies never leave the server verbatim.
+    """
+    return _redact_payload(trace)
+
+
+def _sort_children_by_time(node):
+    """Recursively order ``childCalls`` by execution start time.
+
+    BitDive stores child calls in capture/array order, which is *not*
+    guaranteed to be chronological. Positional diffing and execution-tree
+    rendering both assume chronological order, so we sort by
+    ``callTimeDateStart`` (stable; nodes without a timestamp keep their
+    relative position and sort last). Mutates and returns ``node``.
+    """
+    if isinstance(node, dict):
+        children = node.get("childCalls")
+        if isinstance(children, list) and children:
+            children.sort(
+                key=lambda c: (
+                    not (isinstance(c, dict) and c.get("callTimeDateStart") is not None),
+                    c.get("callTimeDateStart") if isinstance(c, dict) else 0,
+                )
+            )
+            for child in children:
+                _sort_children_by_time(child)
+    elif isinstance(node, list):
+        for item in node:
+            _sort_children_by_time(item)
+    return node
 
 
 def _looks_like_json_blob(value: str) -> bool:
@@ -944,8 +993,8 @@ def _format_heatmap(modules: list) -> str:
     return "\n".join(lines) if lines else "No heatmap data"
 
 
-@mcp.tool(description="Show the system heatmap for all modules, services, and entry methods.")
-async def get_heatmap_all_system(
+@mcp.tool(description="DISCOVERY. Show the system-wide heatmap (error counts, call counts, latency, SQL/REST/queue metrics) for every module, service, class, and method. Start here when you don't yet know which module/service/method to look at, or to find an exact className/methodName.")
+async def get_system_heatmap(
     last_minutes: Annotated[int, Field(description="How many recent minutes to include in the heatmap, capped at 30.")] = 10,
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
 ) -> str:
@@ -960,8 +1009,8 @@ async def get_heatmap_all_system(
     return _format_heatmap(data)
 
 
-@mcp.tool(description="Show the heatmap for one module.")
-async def get_heatmap_for_module(
+@mcp.tool(description="DISCOVERY. Show the heatmap (errors, call counts, latency, SQL/REST/queue metrics) for one module's services, classes, and methods. Use when you know the module but need to drill into its methods.")
+async def get_module_heatmap(
     module_name: Annotated[str, Field(description="Exact module name to filter by.")],
     last_minutes: Annotated[int, Field(description="How many recent minutes to include in the heatmap, capped at 30.")] = 10,
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
@@ -977,8 +1026,8 @@ async def get_heatmap_for_module(
     return _format_heatmap(filtered)
 
 
-@mcp.tool(description="Show the heatmap for one service inside a module.")
-async def get_heatmap_for_service(
+@mcp.tool(description="DISCOVERY. Show the heatmap (errors, call counts, latency, SQL/REST/queue metrics) for one service inside a module. Use when you know module + service and want only that service's methods.")
+async def get_service_heatmap(
     module_name: Annotated[str, Field(description="Exact module name that owns the service.")],
     service_name: Annotated[str, Field(description="Exact service name to filter by.")],
     last_minutes: Annotated[int, Field(description="How many recent minutes to include in the heatmap, capped at 30.")] = 10,
@@ -1005,8 +1054,8 @@ async def get_heatmap_for_service(
 #  Last Call Service  (from LastCallTools.java)
 # ═══════════════════════════════════════════════════════════════
 
-@mcp.tool(description="List recent call IDs for a module and service.")
-async def get_last_calls(
+@mcp.tool(description="DISCOVERY. List the most recent call_ids (with method names and timings) for a module + service. Use to grab a fresh call_id to inspect, or to confirm a replayed request was captured. Returns IDs, not the trace itself.")
+async def list_recent_calls(
     module_name: Annotated[str, Field(description="Exact module name to inspect.")],
     service_name: Annotated[str, Field(description="Exact service name to inspect.")],
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
@@ -1039,23 +1088,135 @@ async def get_last_calls(
 #  Find Trace  (from TraceTools.java)
 # ═══════════════════════════════════════════════════════════════
 
-@mcp.tool(description="Fetch the full raw trace JSON for a call ID.")
-async def find_trace_all(
+def _full_sql_calls(sql_calls: list | None) -> list:
+    """Compact, normalized SQL records for the full-trace view."""
+    out = []
+    for s in sql_calls or []:
+        entry = {"sql": s.get("sql"), "ms": round(s.get("callTimeDelta") or 0, 2)}
+        rows = s.get("driverDataRows")
+        if rows:
+            entry["rows"] = _normalize_payload([r.get("dataRow") for r in rows])
+        elif s.get("sqlReturn") not in (None, "", [], {}):
+            entry["return"] = _normalize_payload(s.get("sqlReturn"))
+        if s.get("errorCallMessage"):
+            entry["error"] = _normalize_payload(s.get("errorCallMessage"))
+        out.append({k: v for k, v in entry.items() if v not in (None, "", [], {})})
+    return out
+
+
+def _full_rest_calls(rest_calls: list | None) -> list:
+    """Compact, normalized, redacted downstream REST records."""
+    out = []
+    for r in rest_calls or []:
+        entry = {
+            "method": r.get("methodRest") or r.get("method"),
+            "uri": r.get("uri"),
+            "status": r.get("statusCode") or r.get("codeResponse"),
+            "ms": round(r.get("callTimeDelta") or 0, 2),
+            "requestHeaders": _normalize_payload(r.get("headers")),
+            "requestBody": _normalize_payload(r.get("body")),
+            "responseHeaders": _normalize_payload(r.get("responseHeaders")),
+            "responseBody": _normalize_payload(r.get("responseBody")),
+            "error": _normalize_payload(r.get("errorCallMessage")) if r.get("errorCallMessage") else None,
+        }
+        out.append({k: v for k, v in entry.items() if v not in (None, "", [], {})})
+    return out
+
+
+def _build_full_node(node: dict) -> dict:
+    """Full-fidelity but de-noised view of one trace node.
+
+    Keeps every analytically relevant field (args, return, SQL, REST, queue,
+    S3, errors, status, timing, children) while stripping Jackson type wrappers,
+    ``@class`` noise, and per-node transport metadata, and redacting secrets via
+    ``_normalize_payload``. Much smaller than the raw trace with no loss of
+    behavioral content.
+    """
+    out = {"method": f"{_short_class(node.get('className', '?'))}.{node.get('methodName', '?')}"}
+    delta = node.get("callTimeDelta")
+    if delta is not None:
+        out["ms"] = round(delta, 2)
+    if node.get("operationType"):
+        out["op"] = node["operationType"]
+    if node.get("codeResponse"):
+        out["status"] = node["codeResponse"]
+    args = _normalize_payload(node.get("args"))
+    if args not in (None, "", [], {}):
+        out["args"] = args
+    ret = _normalize_payload(node.get("methodReturn"))
+    if ret not in (None, "", [], {}):
+        out["return"] = ret
+    if node.get("errorCallMessage"):
+        out["error"] = _normalize_payload(node.get("errorCallMessage"))
+    url = node.get("urlRest") or node.get("url")
+    if url:
+        out["url"] = url
+    sql = _full_sql_calls(node.get("sqlCalls"))
+    if sql:
+        out["sql"] = sql
+    rest = _full_rest_calls(node.get("restCalls"))
+    if rest:
+        out["rest"] = rest
+    if node.get("queueCalls"):
+        out["queue"] = _normalize_payload(node.get("queueCalls"))
+    if node.get("s3SendCalls"):
+        out["s3"] = _normalize_payload(node.get("s3SendCalls"))
+    if node.get("alerts"):
+        out["alerts"] = node.get("alerts")
+    children = [_build_full_node(c) for c in node.get("childCalls") or []]
+    if children:
+        out["children"] = children
+    return out
+
+
+@mcp.tool(description="INSPECT (needs a call_id). Get the full trace tree as a clean, normalized, redacted structure: every node with args, returns, SQL, REST, queue and errors, but without raw Jackson/type-wrapper noise. This is the DEFAULT tool for deep analysis: full fidelity, typically 50-65% smaller than get_trace_raw.")
+async def get_trace(
     call_id: Annotated[str, Field(description="Trace or call ID to load.")],
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
 ) -> str:
-    """Returns the full call trace tree for the specified call ID.
+    """Returns the complete call trace as a normalized, redacted tree.
+
+    Same coverage as get_trace_raw (all nodes, args, returns, SQL rows, REST
+    payloads, queue/S3, errors, children) but de-noised: Jackson ``@class``
+    wrappers and Java type envelopes are collapsed, per-node transport metadata
+    is dropped, secrets are redacted, and child calls are ordered
+    chronologically. Prefer this over get_trace_raw when the raw trace is too
+    large, while keeping full analytical fidelity.
+    """
+    data = await _get(
+        "/mcp/FindTrace/findTraceAll", {"callId": call_id}, mcp_token=mcp_token
+    )
+    if not data:
+        return f"No trace found for call_id {call_id} (check token scope or trace indexing lag)."
+    data = _sort_children_by_time(data)
+    result = {
+        "callId": data.get("messageId"),
+        "traceId": data.get("traceId"),
+        "module": data.get("moduleName"),
+        "service": data.get("serviceName"),
+        "trace": _build_full_node(data),
+    }
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+@mcp.tool(description="INSPECT (needs a call_id). Get the raw, untouched trace JSON (secrets redacted, child calls ordered). This is the verbatim source of truth and can be very large; prefer get_trace for analysis and use this only when you specifically need the raw shape.")
+async def get_trace_raw(
+    call_id: Annotated[str, Field(description="Trace or call ID to load.")],
+    mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
+) -> str:
+    """Returns the full raw call trace tree for the specified call ID.
     Shows the complete hierarchy of method calls, SQL queries,
     REST calls, and queue operations within a single request.
     """
     data = await _get(
         "/mcp/FindTrace/findTraceAll", {"callId": call_id}, mcp_token=mcp_token
     )
+    data = _redact_trace(_sort_children_by_time(data))
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
-@mcp.tool(description="Fetch the trace subtree for one class and method inside a call.")
-async def find_trace_for_method(
+@mcp.tool(description="INSPECT (needs a call_id). Get just the subtree for one class.method inside a known trace, instead of the whole tree. Use to zoom into a specific method's execution once you know its className and methodName.")
+async def get_trace_subtree(
     call_id: Annotated[str, Field(description="Trace or call ID that contains the target method call.")],
     class_name: Annotated[str, Field(description="Fully qualified class name to extract from the trace.")],
     method_name: Annotated[str, Field(description="Method name to extract from the trace.")],
@@ -1073,11 +1234,12 @@ async def find_trace_for_method(
         },
         mcp_token=mcp_token,
     )
+    data = _redact_trace(_sort_children_by_time(data))
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
-@mcp.tool(description="Find call IDs for a class and method within a time range.")
-async def find_trace_between_time(
+@mcp.tool(description="DISCOVERY / SEARCH. Find historical call_ids for a given class.method within a time window. Returns matching call_ids (not the trace itself) - feed one into get_trace to inspect it.")
+async def find_calls_by_method(
     class_name: Annotated[str, Field(description="Fully qualified class name to search for.")],
     method_name: Annotated[str, Field(description="Method name to search for.")],
     begin_date: Annotated[str, Field(description="Start of the search window in ISO-8601 format with timezone offset.")],
@@ -1101,8 +1263,8 @@ async def find_trace_between_time(
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
-@mcp.tool(description="Resolve call IDs into short Class.method names.")
-async def get_trace_names_batch(
+@mcp.tool(description="UTILITY. Resolve a batch of call_ids into short Class.method names (max 35). Use to label unknown call_ids, e.g. those listed in a test group. Does not return trace bodies.")
+async def resolve_call_ids(
     call_ids: Annotated[list[str], Field(description="List of trace or call IDs to resolve. Only the first 35 IDs are processed.")],
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
 ) -> str:
@@ -1136,8 +1298,8 @@ async def get_trace_names_batch(
     return "\n".join(results)
 
 
-@mcp.tool(description="Build curl and PowerShell commands to replay a captured web request.")
-async def get_reproduction_command(
+@mcp.tool(description="REPRODUCE (needs a call_id). Build curl and PowerShell commands that replay a captured web request (URL, method, headers, body from the trace). Run the command, wait ~45s, then find the new trace via list_recent_calls.")
+async def get_replay_command(
     call_id: Annotated[str, Field(description="Trace or call ID of the captured web request to replay.")],
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
 ) -> str:
@@ -1221,8 +1383,8 @@ async def get_reproduction_command(
 #  Method Documentation  (from api-docs.json /mcp/MethodDoc/*)
 # ═══════════════════════════════════════════════════════════════
 
-@mcp.tool(description="Search method documentation and return short matches.")
-async def search_methods_short(
+@mcp.tool(description="DISCOVERY / SEARCH. Search method documentation by keyword or business term and return short summaries of matching methods. Use to locate a method by intent when you don't know its exact class/name.")
+async def search_methods(
     query: Annotated[str, Field(description="Keyword, business term, or partial method name to search for.")],
     limit: Annotated[int, Field(description="Maximum number of results to return.")] = 10,
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
@@ -1241,8 +1403,8 @@ async def search_methods_short(
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
-@mcp.tool(description="Search method documentation and return detailed matches.")
-async def search_methods_full(
+@mcp.tool(description="DISCOVERY / SEARCH. Like search_methods but returns full details (call statistics, trace info) for fewer matches. Use when you already narrowed the query and want richer context per method.")
+async def search_methods_detailed(
     query: Annotated[str, Field(description="Keyword, business term, or partial method name to search for.")],
     limit: Annotated[int, Field(description="Maximum number of detailed results to return.")] = 3,
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
@@ -1266,7 +1428,7 @@ async def search_methods_full(
 # ═══════════════════════════════════════════════════════════════
 
 
-@mcp.tool(description="Create a new BitDive test group from trace call IDs.")
+@mcp.tool(description="TESTS. Create a new BitDive test group (UNIT/COMPONENT/INTEGRATION) from a list of trace call_ids. Creates a brand-new group with a new UUID.")
 async def create_test_group(
     name: Annotated[str, Field(description="Human-readable name for the new test group.")],
     test_type: Annotated[str, Field(description="Test type to create: UNIT, COMPONENT, or INTEGRATION.")],
@@ -1298,8 +1460,8 @@ async def create_test_group(
     )
     return json.dumps(data, ensure_ascii=False, default=str)
 
-@mcp.tool(description="List all BitDive test groups.")
-async def get_all_test_scripts(
+@mcp.tool(description="TESTS. List all test groups with their id, name, type, enabled flag, pass/fail status, and class count. Start here to find a test group id.")
+async def list_test_groups(
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
 ) -> str:
     """Returns all test scripts (test groups) from the system."""
@@ -1321,8 +1483,8 @@ async def get_all_test_scripts(
         lines.append(f"{prefix}{sid} | {name:<35} | {stype:<6} | {status:<4} | {n_classes}")
     return "\n".join(lines)
 
-@mcp.tool(description="List class-level entries inside a test group.")
-async def get_script_data(
+@mcp.tool(description="TESTS. List the class-level entries inside one test group (each with its id, class, service, enabled/result status, and source call_ids).")
+async def list_test_group_classes(
     test_script_id: Annotated[str, Field(description="Test group ID to inspect.")],
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
 ) -> str:
@@ -1347,8 +1509,8 @@ async def get_script_data(
         lines.append(f"  {eid}  {cls} ({svc})  enabled={enabled} result={result}  calls={call_ids}")
     return "\n".join(lines)
 
-@mcp.tool(description="List method-level tests under one script data entry.")
-async def get_script_data_test(
+@mcp.tool(description="TESTS. List the method-level tests under one class-level entry of a test group.")
+async def list_test_group_methods(
     test_script_data_id: Annotated[str, Field(description="Class-level script data entry ID to inspect.")],
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
 ) -> str:
@@ -1475,8 +1637,8 @@ async def _build_replace_payload(
         "callId": source_message_id,
     }
 
-@mcp.tool(description="Build the replace payload for one method-level test using MCP-accessible APIs.")
-async def get_tests_by_call_for_test_script(
+@mcp.tool(description="TESTS. Build the replace payload for one method-level test (the data BitDive uses to update that test). Mostly an internal/advanced step.")
+async def build_test_payload(
     script_data_test_id: Annotated[str, Field(description="Method-level test entry ID to rebuild the replace payload for.")],
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
 ) -> str:
@@ -1484,8 +1646,8 @@ async def get_tests_by_call_for_test_script(
     data = await _build_replace_payload(script_data_test_id, mcp_token=mcp_token)
     return json.dumps(data, ensure_ascii=False, default=str)
 
-@mcp.tool(description="Delete a BitDive test group.")
-async def delete_test_script(
+@mcp.tool(description="TESTS. Delete an entire test group by id.")
+async def delete_test_group(
     test_script_id: Annotated[str, Field(description="Test group ID to delete.")],
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
 ) -> str:
@@ -1497,8 +1659,8 @@ async def delete_test_script(
     )
     return json.dumps(data, ensure_ascii=False, default=str)
 
-@mcp.tool(description="Enable or disable a BitDive test group.")
-async def enabled_test_script(
+@mcp.tool(description="TESTS. Enable or disable a test group by id (controls whether it runs).")
+async def set_test_group_enabled(
     test_script_id: Annotated[str, Field(description="Test group ID to enable or disable.")],
     enabled: Annotated[bool, Field(description="Set to true to enable the group, false to disable it.")] = True,
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
@@ -1512,8 +1674,8 @@ async def enabled_test_script(
     )
     return json.dumps(data, ensure_ascii=False, default=str)
 
-@mcp.tool(description="Regenerate a test entry with a new set of trace call IDs.")
-async def regenerate_tests_by_call_for_test_script(
+@mcp.tool(description="TESTS. Regenerate one method-level test from a new set of trace call_ids (refreshes its expected behavior against newer traces).")
+async def regenerate_test(
     script_data_test_id: Annotated[str, Field(description="Method-level test entry ID to regenerate.")],
     new_call_ids: Annotated[list[str], Field(description="Replacement trace call IDs to use for regeneration.")],
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
@@ -1536,8 +1698,8 @@ async def regenerate_tests_by_call_for_test_script(
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
-@mcp.tool(description="Summarize pass/fail results and failure details for a test group.")
-async def get_test_failure_details(
+@mcp.tool(description="TESTS. Get a pass/fail summary and failure details for a test group's last run. Use to understand WHY tests failed without opening the BitDive UI.")
+async def get_test_results(
     test_script_id: Annotated[str, Field(description="Test group ID whose execution results should be summarized.")],
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
 ) -> str:
@@ -1606,8 +1768,8 @@ async def get_test_failure_details(
     return "\n".join(lines)
 
 
-@mcp.tool(description="Compare multiple traces in chronological order to show how behavior changed over time.")
-async def compare_trace_evolution(
+@mcp.tool(description="COMPARE (needs 2+ call_ids). Compare a chronological series of traces (oldest to newest) to show how a method's behavior evolved across deployments. For a single before/after pair, use compare_traces instead.")
+async def compare_traces_over_time(
     call_ids: Annotated[list[str], Field(description="Trace call IDs in chronological order, from oldest to newest.")],
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
 ) -> str:
@@ -1629,7 +1791,7 @@ async def compare_trace_evolution(
             {"callId": cid},
             mcp_token=mcp_token,
         )
-        traces.append(trace)
+        traces.append(_sort_children_by_time(trace))
     
     def _extract_metrics(trace):
         methods = []
@@ -1899,24 +2061,24 @@ def _build_summary(trace: dict) -> str:
     return f"{header}\n\nExecution tree:\n{body}"
 
 
-@mcp.tool(description="Return a readable summary of a call trace.")
-async def find_trace_summary(
+@mcp.tool(description="INSPECT (needs a call_id). Get a compact, human-readable summary of a trace: the execution tree with method names, timings, SQL, REST, return values, and errors. Best first look at a trace; use get_trace when you need the full structured payloads.")
+async def get_trace_overview(
     call_id: Annotated[str, Field(description="Trace or call ID to summarize.")],
     mcp_token: Annotated[str | None, Field(description="Optional BitDive MCP token. Uses BITDIVE_MCP_TOKEN from the environment when omitted.")] = None,
 ) -> str:
     """Returns a human-readable summary of a call trace.
     Shows the execution tree with method names, timings, SQL queries,
     REST calls, return values, and errors in a compact format.
-    Use this instead of find_trace_all when you need to understand
+    Use this instead of get_trace_raw when you need to understand
     what a method does without parsing raw JSON.
     """
     data = await _get(
         "/mcp/FindTrace/findTraceAll", {"callId": call_id}, mcp_token=mcp_token
     )
-    return _build_summary(data)
+    return _build_summary(_sort_children_by_time(data))
 
 
-@mcp.tool(description="Compare two traces and highlight timing, payload, query, and error differences.")
+@mcp.tool(description="COMPARE (needs 2 call_ids). Diff a before/after pair of traces and highlight timing, payload, SQL, and error differences - the core tool for behavioral regression review of a change. For 3+ traces over time, use compare_traces_over_time.")
 async def compare_traces(
     before_call_id: Annotated[str, Field(description="Baseline trace call ID to compare from.")],
     after_call_id: Annotated[str, Field(description="New trace call ID to compare against the baseline.")],
@@ -1936,6 +2098,10 @@ async def compare_traces(
         {"callId": after_call_id},
         mcp_token=mcp_token,
     )
+    # Order children chronologically so positional contract diffing and
+    # first-divergence detection match equivalent nodes across traces.
+    before = _sort_children_by_time(before) if before else before
+    after = _sort_children_by_time(after) if after else after
     before_contracts = _build_contract_entries(before) if before else []
     after_contracts = _build_contract_entries(after) if after else []
 

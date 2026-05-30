@@ -30,6 +30,7 @@ It wraps BitDive API endpoints and makes them usable for agent workflows:
 - Bash and PowerShell reproduction commands from captured requests
 - before/after trace comparison with payload and contract drift reporting
 - SQL normalization and volatile-field filtering to reduce noisy diffs
+- automatic secret redaction and chronological child-call ordering on trace paths
 - test-group inspection and regression-management flows
 
 ## What It Is For
@@ -46,17 +47,28 @@ Use this server when an AI agent or developer needs to:
 
 ## Tool Inventory
 
-The current server exposes 23 MCP tools.
+The current server exposes 24 MCP tools.
 
-| Group | Tools |
-| --- | --- |
-| Discovery | `get_heatmap_all_system`, `get_heatmap_for_module`, `get_heatmap_for_service` |
-| Recent traces | `get_last_calls` |
-| Trace lookup | `find_trace_all`, `find_trace_for_method`, `find_trace_between_time`, `get_trace_names_batch` |
-| Reproduction | `get_reproduction_command` |
-| Method docs | `search_methods_short`, `search_methods_full` |
-| Test management | `create_test_group`, `get_all_test_scripts`, `get_script_data`, `get_script_data_test`, `get_tests_by_call_for_test_script`, `delete_test_script`, `enabled_test_script`, `regenerate_tests_by_call_for_test_script`, `get_test_failure_details` |
-| Trace intelligence | `find_trace_summary`, `compare_traces`, `compare_trace_evolution` |
+Tool names follow their intent: **discovery** tools (you do not have an id yet) start with `get_*_heatmap` / `list_*` / `find_*` / `search_*`; **inspect** tools (you already have a `call_id`) start with `get_trace*`; **compare** tools diff traces.
+
+| Group | Tools | When to use |
+| --- | --- | --- |
+| Discovery (heatmaps) | `get_system_heatmap`, `get_module_heatmap`, `get_service_heatmap` | Don't know where to look yet; find a class/method and its metrics |
+| Discovery (calls/methods) | `list_recent_calls`, `find_calls_by_method`, `search_methods`, `search_methods_detailed` | Get `call_id`s or locate a method by keyword |
+| Inspect one trace (needs `call_id`) | `get_trace_overview`, `get_trace`, `get_trace_raw`, `get_trace_subtree` | Read a known trace: overview → full de-noised → raw → single subtree |
+| Compare | `compare_traces`, `compare_traces_over_time` | Before/after diff, or a chronological series |
+| Reproduce | `get_replay_command` | Rebuild a curl/PowerShell command to replay a request |
+| Utility | `resolve_call_ids` | Map `call_id`s to short `Class.method` names |
+| Tests | `create_test_group`, `list_test_groups`, `list_test_group_classes`, `list_test_group_methods`, `build_test_payload`, `delete_test_group`, `set_test_group_enabled`, `regenerate_test`, `get_test_results` | Manage and inspect record-and-replay test groups |
+
+## Typical Workflow
+
+1. **Discover** — `get_system_heatmap` or `list_recent_calls` to find a method or fresh `call_id`.
+2. **Inspect** — `get_trace_overview` for a quick tree; `get_trace` for full de-noised payloads (default for deep analysis).
+3. **Compare** — `compare_traces` for before/after; open `get_trace` when the diff needs payload proof.
+4. **Reproduce** — `get_replay_command`, run it, wait ~45s, then `list_recent_calls` again.
+
+Tool names encode intent: discovery tools when you do **not** have a `call_id` yet; `get_trace*` when you **do**.
 
 ## What The Code Adds
 
@@ -64,7 +76,9 @@ Several important behaviors are implemented inside `server.py`, not just delegat
 
 ### Trace readability
 
-- `find_trace_summary` builds a readable execution tree
+- `get_trace_overview` builds a readable execution tree
+- `get_trace` returns the whole tree with full fidelity but without raw Jackson/type-wrapper noise (typically 50-65% smaller than `get_trace_raw`, secrets redacted, child calls ordered chronologically)
+- `get_trace_raw` and `get_trace_subtree` are also redacted; use them only when you need the verbatim shape or a single method boundary
 - SQL, REST, queue calls, timings, return values, and errors are formatted for direct MCP output
 
 ### Trace comparison
