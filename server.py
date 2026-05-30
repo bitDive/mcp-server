@@ -159,6 +159,9 @@ def _should_skip_reproduction_header(header_name: str) -> bool:
         "connection",
         "accept-encoding",
         "expect",
+        "authorization",
+        "cookie",
+        "set-cookie",
     }:
         return True
     return normalized.startswith("x-bitdiv-")
@@ -194,7 +197,7 @@ def _normalize_sql(sql: str) -> str:
 
 
 _VOLATILE_KEY_RE = re.compile(
-    r"(^|\.)(id|.*Id|traceId|spanId|messageId|callId|uuid|timestamp|date|createdAt|updatedAt)$",
+    r"(^|\.)(id|.*Id|traceId|spanId|messageId|callId|uuid|timestamp|date|createdAt|updatedAt|createdOn|createdBy|lastModifiedOn|lastModifiedBy)$",
     re.IGNORECASE,
 )
 _UUID_RE = re.compile(
@@ -202,6 +205,15 @@ _UUID_RE = re.compile(
     re.IGNORECASE,
 )
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ][0-9:\.\-+Z]*$")
+_SENSITIVE_KEY_RE = re.compile(
+    r"(authorization|cookie|set-cookie|access[_-]?token|refresh[_-]?token|password|client[_-]?secret)",
+    re.IGNORECASE,
+)
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_\-]+?\.[A-Za-z0-9_\-]+?\.[A-Za-z0-9_\-]+?\b")
+_BENIGN_REVIEW_DIFF_RE = re.compile(
+    r"(^|\.)(note)(:|$)|request\.headers|Content-Length",
+    re.IGNORECASE,
+)
 
 
 def _normalize_typed_key(key: str) -> str:
@@ -209,6 +221,36 @@ def _normalize_typed_key(key: str) -> str:
     if key.startswith("string:") and key.count(":") >= 2:
         return key.split(":", 2)[2]
     return key
+
+
+def _redact_string(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    stripped = text.strip()
+    if stripped.lower().startswith("bearer "):
+        return "Bearer <REDACTED>"
+    if _JWT_RE.search(stripped):
+        return _JWT_RE.sub("<REDACTED_JWT>", stripped)
+    return stripped
+
+
+def _redact_payload(value, key_path: str = ""):
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            child_path = f"{key_path}.{key}" if key_path else str(key)
+            if _SENSITIVE_KEY_RE.search(str(key)):
+                redacted[key] = "<REDACTED>"
+            else:
+                redacted[key] = _redact_payload(item, child_path)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_payload(item, key_path) for item in value]
+    if isinstance(value, str):
+        if _SENSITIVE_KEY_RE.search(key_path):
+            return "<REDACTED>"
+        return _redact_string(value)
+    return value
 
 
 def _looks_like_json_blob(value: str) -> bool:
@@ -244,13 +286,13 @@ def _normalize_payload(value):
     if isinstance(value, str):
         parsed = _safe_json_loads(value)
         if parsed is value:
-            return value.strip()
-        return _normalize_payload(parsed)
+            return _redact_payload(value.strip())
+        return _redact_payload(_normalize_payload(parsed))
 
     if isinstance(value, list):
         if len(value) == 2 and isinstance(value[0], str) and value[0].startswith("java."):
-            return _normalize_payload(value[1])
-        return [_normalize_payload(item) for item in value]
+            return _redact_payload(_normalize_payload(value[1]))
+        return _redact_payload([_normalize_payload(item) for item in value])
 
     if isinstance(value, dict):
         normalized = {}
@@ -262,14 +304,14 @@ def _normalize_payload(value):
                 continue
             normalized[_normalize_typed_key(key)] = _normalize_payload(item)
         if set(normalized.keys()) == {"parIndex", "paramType", "val"}:
-            return {
+            return _redact_payload({
                 "index": normalized.get("parIndex"),
                 "type": normalized.get("paramType"),
                 "value": normalized.get("val"),
-            }
-        return normalized
+            })
+        return _redact_payload(normalized)
 
-    return value
+    return _redact_payload(value)
 
 
 def _summarize_scalar(value) -> str:
@@ -418,6 +460,334 @@ def _build_contract_entries(trace: dict) -> list[dict]:
 
 def _index_contract_entries(entries: list[dict]) -> dict[str, dict]:
     return {entry["path"]: entry for entry in entries}
+
+
+def _trace_depth(path: str) -> int:
+    return path.count("/")
+
+
+def _iter_nodes(node: dict, parent_path: str = "", path_counts: Counter | None = None):
+    if path_counts is None:
+        path_counts = Counter()
+    signature = _signature(node)
+    path_counts[parent_path] += 1
+    ordinal = path_counts[parent_path]
+    path = f"{parent_path}/{signature}[{ordinal}]"
+    yield path, node
+    child_counts = Counter()
+    for child in node.get("childCalls", []):
+        yield from _iter_nodes(child, path, child_counts)
+
+
+def _root_contract(entry: dict) -> dict:
+    return {
+        "request": entry.get("request", {}),
+        "response": entry.get("response", {}),
+        "restCalls": entry.get("restCalls", []),
+    }
+
+
+def _filter_review_noise_changes(changes: list[str]) -> list[str]:
+    return [change for change in changes if not _BENIGN_REVIEW_DIFF_RE.search(change)]
+
+
+def _find_first_divergence(before_entries: list[dict], after_entries: list[dict]):
+    before_index = _index_contract_entries(before_entries)
+    after_index = _index_contract_entries(after_entries)
+    shared_paths = sorted(
+        set(before_index.keys()) & set(after_index.keys()),
+        key=lambda p: (_trace_depth(p), p),
+    )
+    fallback_candidate = None
+    for path in shared_paths:
+        before_entry = before_index[path]
+        after_entry = after_index[path]
+        changes = _diff_values(
+            _root_contract(before_entry),
+            _root_contract(after_entry),
+            ignore_volatile=True,
+        )
+        filtered_changes = _filter_review_noise_changes(changes)
+        if filtered_changes and _trace_depth(path) > 1:
+            return {
+                "path": path,
+                "signature": before_entry.get("signature", "?"),
+                "changes": filtered_changes,
+            }
+        if filtered_changes and fallback_candidate is None:
+            fallback_candidate = {
+                "path": path,
+                "signature": before_entry.get("signature", "?"),
+                "changes": filtered_changes,
+            }
+
+    added_paths = sorted(set(after_index.keys()) - set(before_index.keys()), key=lambda p: (_trace_depth(p), p))
+    if added_paths:
+        path = added_paths[0]
+        entry = after_index[path]
+        return {
+            "path": path,
+            "signature": entry.get("signature", "?"),
+            "changes": ["path added in AFTER"],
+        }
+
+    removed_paths = sorted(set(before_index.keys()) - set(after_index.keys()), key=lambda p: (_trace_depth(p), p))
+    if removed_paths:
+        path = removed_paths[0]
+        entry = before_index[path]
+        return {
+            "path": path,
+            "signature": entry.get("signature", "?"),
+            "changes": ["path removed in AFTER"],
+        }
+    return fallback_candidate
+
+
+def _classify_baseline_quality(trace: dict) -> tuple[str, str]:
+    root_status = trace.get("codeResponse") or 0
+    errors = []
+    fallback_seen = False
+    downstream_seen = False
+
+    for _, node in _iter_nodes(trace):
+        sig = _signature(node)
+        err = node.get("errorCallMessage") or ""
+        if err:
+            errors.append((sig, err))
+        if "Fallback" in sig or "CircuitBreak" in sig:
+            fallback_seen = True
+        if node.get("restCalls"):
+            downstream_seen = True
+
+    if root_status >= 500 and errors:
+        if any(
+            marker in err
+            for _, err in errors
+            for marker in ("HttpClientErrorException", "ResourceAccessException", "ConnectException", "404 NOT_FOUND")
+        ):
+            return ("CONTAMINATED_BY_ENV_OR_DOWNSTREAM", "Root failure includes downstream/env error details.")
+        if fallback_seen or downstream_seen:
+            return ("CONTAMINATED_BY_PREEXISTING_BUG", "Root failure path is noisy and includes downstream/fallback activity.")
+    if fallback_seen and errors:
+        return ("CONTAMINATED_BY_ENV_OR_DOWNSTREAM", "Fallback / circuit-breaker noise present in baseline trace.")
+    return ("CLEAN", "No material contamination detected in baseline trace.")
+
+
+def _looks_like_write_node(node: dict) -> bool:
+    method = (node.get("methodName") or "").lower()
+    op = (node.get("operationType") or "").upper()
+    if op == "DB" and any(token in method for token in ("save", "delete", "update", "insert", "persist", "remove")):
+        return True
+    if op == "METHOD" and any(token in method for token in ("save", "delete", "update", "insert", "persist", "create")):
+        return True
+    return False
+
+
+def _extract_write_events(trace: dict) -> list[dict]:
+    events = []
+    for path, node in _iter_nodes(trace):
+        if not _looks_like_write_node(node):
+            continue
+        events.append(
+            {
+                "path": path,
+                "signature": _signature(node),
+                "operationType": node.get("operationType"),
+                "args": _normalize_payload(node.get("args")),
+                "return": _normalize_payload(node.get("methodReturn")),
+                "error": _normalize_payload(node.get("errorCallMessage")),
+            }
+        )
+    return events
+
+
+def _format_write_event(event: dict) -> str:
+    parts = [event.get("signature", "?")]
+    args_payload = event.get("args")
+    if args_payload not in (None, "", [], {}):
+        parts.append(f"args={_summarize_scalar(args_payload)}")
+    ret_payload = event.get("return")
+    if ret_payload not in (None, "", [], {}):
+        parts.append(f"return={_summarize_scalar(ret_payload)}")
+    err_payload = event.get("error")
+    if err_payload not in (None, "", [], {}):
+        parts.append(f"error={_summarize_scalar(err_payload)}")
+    return " | ".join(parts)
+
+
+def _format_write_delta(before_trace: dict, after_trace: dict) -> list[str]:
+    before_events = _extract_write_events(before_trace)
+    after_events = _extract_write_events(after_trace)
+    before_index = {event["path"]: event for event in before_events}
+    after_index = {event["path"]: event for event in after_events}
+
+    lines = []
+    removed = sorted(set(before_index.keys()) - set(after_index.keys()))
+    added = sorted(set(after_index.keys()) - set(before_index.keys()))
+    changed = []
+    for path in sorted(set(before_index.keys()) & set(after_index.keys())):
+        diffs = _diff_values(
+            {
+                "args": before_index[path].get("args"),
+                "return": before_index[path].get("return"),
+                "error": before_index[path].get("error"),
+            },
+            {
+                "args": after_index[path].get("args"),
+                "return": after_index[path].get("return"),
+                "error": after_index[path].get("error"),
+            },
+            ignore_volatile=True,
+        )
+        if diffs:
+            changed.append((path, before_index[path], diffs))
+
+    if removed or added or changed:
+        lines.append("PERSISTENCE / WRITE DELTA:")
+        for path in removed[:6]:
+            lines.append(f"  - REMOVED WRITE: {_format_write_event(before_index[path])}")
+        for path in added[:6]:
+            lines.append(f"  + NEW WRITE: {_format_write_event(after_index[path])}")
+        for path, event, diffs in changed[:6]:
+            lines.append(f"  Δ CHANGED WRITE: {event.get('signature', '?')} @ {path}")
+            for diff in diffs[:3]:
+                lines.append(f"    - {diff}")
+        lines.append("")
+    return lines
+
+
+def _extract_downstream_events(trace: dict) -> list[dict]:
+    events = []
+    for path, node in _iter_nodes(trace):
+        for idx, rest in enumerate(node.get("restCalls", []), 1):
+            events.append(
+                {
+                    "path": f"{path}/REST[{idx}]",
+                    "signature": _signature(node),
+                    "method": rest.get("methodRest") or rest.get("method"),
+                    "uri": rest.get("uri"),
+                    "status": rest.get("statusCode"),
+                    "requestHeaders": _normalize_payload(rest.get("headers")),
+                    "requestBody": _normalize_payload(rest.get("body")),
+                    "responseHeaders": _normalize_payload(rest.get("responseHeaders")),
+                    "responseBody": _normalize_payload(rest.get("responseBody")),
+                    "error": _normalize_payload(rest.get("errorCallMessage")),
+                }
+            )
+    return events
+
+
+def _format_downstream_event(event: dict) -> str:
+    parts = [event.get("signature", "?"), f"{event.get('method', '?')} {event.get('uri', '?')}"]
+    if event.get("requestBody") not in (None, "", [], {}):
+        parts.append(f"requestBody={_summarize_scalar(event['requestBody'])}")
+    if event.get("responseBody") not in (None, "", [], {}):
+        parts.append(f"responseBody={_summarize_scalar(event['responseBody'])}")
+    if event.get("error") not in (None, "", [], {}):
+        parts.append(f"error={_summarize_scalar(event['error'])}")
+    return " | ".join(parts)
+
+
+def _format_downstream_delta(before_trace: dict, after_trace: dict) -> list[str]:
+    before_events = _extract_downstream_events(before_trace)
+    after_events = _extract_downstream_events(after_trace)
+    before_index = {event["path"]: event for event in before_events}
+    after_index = {event["path"]: event for event in after_events}
+
+    lines = []
+    removed = sorted(set(before_index.keys()) - set(after_index.keys()))
+    added = sorted(set(after_index.keys()) - set(before_index.keys()))
+    changed = []
+    for path in sorted(set(before_index.keys()) & set(after_index.keys())):
+        diffs = _diff_values(
+            {
+                "method": before_index[path].get("method"),
+                "uri": before_index[path].get("uri"),
+                "status": before_index[path].get("status"),
+                "requestBody": before_index[path].get("requestBody"),
+                "responseBody": before_index[path].get("responseBody"),
+                "error": before_index[path].get("error"),
+            },
+            {
+                "method": after_index[path].get("method"),
+                "uri": after_index[path].get("uri"),
+                "status": after_index[path].get("status"),
+                "requestBody": after_index[path].get("requestBody"),
+                "responseBody": after_index[path].get("responseBody"),
+                "error": after_index[path].get("error"),
+            },
+            ignore_volatile=True,
+        )
+        if diffs:
+            changed.append((path, before_index[path], diffs))
+
+    if removed or added or changed:
+        lines.append("DOWNSTREAM PAYLOAD DELTA:")
+        removed_counter = Counter(_format_downstream_event(before_index[path]) for path in removed)
+        added_counter = Counter(_format_downstream_event(after_index[path]) for path in added)
+        for text, count in list(removed_counter.items())[:6]:
+            suffix = f" (x{count})" if count > 1 else ""
+            lines.append(f"  - REMOVED DOWNSTREAM CALL{suffix}: {text}")
+        for text, count in list(added_counter.items())[:6]:
+            suffix = f" (x{count})" if count > 1 else ""
+            lines.append(f"  + NEW DOWNSTREAM CALL{suffix}: {text}")
+        for path, event, diffs in changed[:6]:
+            lines.append(f"  Δ CHANGED DOWNSTREAM: {event.get('signature', '?')} @ {path}")
+            for diff in diffs[:4]:
+                lines.append(f"    - {diff}")
+        lines.append("")
+    return lines
+
+
+def _collect_retry_noise(trace: dict) -> dict:
+    signature_counts = Counter()
+    error_counts = Counter()
+    fallback_methods = Counter()
+    for _, node in _iter_nodes(trace):
+        sig = _signature(node)
+        signature_counts[sig] += 1
+        err = node.get("errorCallMessage") or ""
+        if err:
+            error_counts[f"{sig} :: {_truncate(_redact_string(err), 120)}"] += 1
+        if "Fallback" in sig or "CircuitBreak" in sig:
+            fallback_methods[sig] += 1
+    repeated_errors = [(k, v) for k, v in error_counts.items() if v > 1]
+    repeated_methods = [(k, v) for k, v in signature_counts.items() if v > 1]
+    return {
+        "fallbacks": fallback_methods,
+        "repeated_errors": repeated_errors,
+        "repeated_methods": repeated_methods,
+    }
+
+
+def _format_retry_noise(before_trace: dict, after_trace: dict) -> list[str]:
+    before_noise = _collect_retry_noise(before_trace)
+    after_noise = _collect_retry_noise(after_trace)
+
+    lines = []
+    interesting = False
+    lines.append("RETRY / FALLBACK NOISE:")
+
+    if before_noise["fallbacks"] or after_noise["fallbacks"]:
+        interesting = True
+        lines.append("  Fallback handlers:")
+        for sig, count in before_noise["fallbacks"].items():
+            lines.append(f"    BEFORE {sig}: {count} calls")
+        for sig, count in after_noise["fallbacks"].items():
+            lines.append(f"    AFTER  {sig}: {count} calls")
+
+    if before_noise["repeated_errors"] or after_noise["repeated_errors"]:
+        interesting = True
+        lines.append("  Repeated child errors:")
+        for err, count in before_noise["repeated_errors"][:4]:
+            lines.append(f"    BEFORE x{count}: {err}")
+        for err, count in after_noise["repeated_errors"][:4]:
+            lines.append(f"    AFTER  x{count}: {err}")
+
+    if not interesting:
+        lines.append("  None")
+    lines.append("")
+    return lines
 
 
 def _format_contract_section(before: dict, after: dict) -> list[str]:
@@ -1674,10 +2044,31 @@ async def compare_traces(
         f"",
     ]
 
+    baseline_quality, baseline_reason = _classify_baseline_quality(before)
+    lines.extend(
+        [
+            "BASELINE QUALITY:",
+            f"  {baseline_quality}: {baseline_reason}",
+            "",
+        ]
+    )
+
     if before_contracts and after_contracts:
         lines.extend(_format_contract_section(before_contracts[0], after_contracts[0]))
         lines.extend(_format_path_contract_changes(before_contracts, after_contracts))
+        first_divergence = _find_first_divergence(before_contracts, after_contracts)
+        if first_divergence:
+            lines.append("FIRST DIVERGENCE:")
+            lines.append(
+                f"  {first_divergence['signature']} @ {first_divergence['path']}"
+            )
+            for change in first_divergence["changes"][:5]:
+                lines.append(f"    - {change}")
+            lines.append("")
 
+    lines.extend(_format_write_delta(before, after))
+    lines.extend(_format_downstream_delta(before, after))
+    lines.extend(_format_retry_noise(before, after))
 
     # --- Section: Methods Diff ---
     all_methods = set(b_methods_count.keys()) | set(a_methods_count.keys())
