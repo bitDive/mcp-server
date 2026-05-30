@@ -253,6 +253,42 @@ def _redact_payload(value, key_path: str = ""):
     return value
 
 
+def _redact_trace(trace):
+    """Redact tokens/secrets across an entire raw trace tree.
+
+    Applied to the source-of-truth tools (``find_trace_all`` /
+    ``find_trace_for_method``) so bearer tokens, JWTs, cookies, and
+    credential-bearing headers/bodies never leave the server verbatim.
+    """
+    return _redact_payload(trace)
+
+
+def _sort_children_by_time(node):
+    """Recursively order ``childCalls`` by execution start time.
+
+    BitDive stores child calls in capture/array order, which is *not*
+    guaranteed to be chronological. Positional diffing and execution-tree
+    rendering both assume chronological order, so we sort by
+    ``callTimeDateStart`` (stable; nodes without a timestamp keep their
+    relative position and sort last). Mutates and returns ``node``.
+    """
+    if isinstance(node, dict):
+        children = node.get("childCalls")
+        if isinstance(children, list) and children:
+            children.sort(
+                key=lambda c: (
+                    not (isinstance(c, dict) and c.get("callTimeDateStart") is not None),
+                    c.get("callTimeDateStart") if isinstance(c, dict) else 0,
+                )
+            )
+            for child in children:
+                _sort_children_by_time(child)
+    elif isinstance(node, list):
+        for item in node:
+            _sort_children_by_time(item)
+    return node
+
+
 def _looks_like_json_blob(value: str) -> bool:
     if not isinstance(value, str):
         return False
@@ -1051,6 +1087,7 @@ async def find_trace_all(
     data = await _get(
         "/mcp/FindTrace/findTraceAll", {"callId": call_id}, mcp_token=mcp_token
     )
+    data = _redact_trace(_sort_children_by_time(data))
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
@@ -1073,6 +1110,7 @@ async def find_trace_for_method(
         },
         mcp_token=mcp_token,
     )
+    data = _redact_trace(_sort_children_by_time(data))
     return json.dumps(data, ensure_ascii=False, default=str)
 
 
@@ -1629,7 +1667,7 @@ async def compare_trace_evolution(
             {"callId": cid},
             mcp_token=mcp_token,
         )
-        traces.append(trace)
+        traces.append(_sort_children_by_time(trace))
     
     def _extract_metrics(trace):
         methods = []
@@ -1913,7 +1951,7 @@ async def find_trace_summary(
     data = await _get(
         "/mcp/FindTrace/findTraceAll", {"callId": call_id}, mcp_token=mcp_token
     )
-    return _build_summary(data)
+    return _build_summary(_sort_children_by_time(data))
 
 
 @mcp.tool(description="Compare two traces and highlight timing, payload, query, and error differences.")
@@ -1936,6 +1974,10 @@ async def compare_traces(
         {"callId": after_call_id},
         mcp_token=mcp_token,
     )
+    # Order children chronologically so positional contract diffing and
+    # first-divergence detection match equivalent nodes across traces.
+    before = _sort_children_by_time(before) if before else before
+    after = _sort_children_by_time(after) if after else after
     before_contracts = _build_contract_entries(before) if before else []
     after_contracts = _build_contract_entries(after) if after else []
 
